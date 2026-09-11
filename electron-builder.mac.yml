@@ -4,7 +4,6 @@ directories:
   output: release
 asar: true
 asarUnpack:
-  - "**/vendor/srt-win/**"
   - "**/node_modules/@ast-grep/**"
   - "**/node_modules/@playwright/**"
   - "**/node_modules/playwright/**"
@@ -18,12 +17,15 @@ files:
   - vendor/**/*
   - "!vendor/cloud-music-mcp/**/*"
   - "!vendor/cyrene-skills/**/*"
+  - "!vendor/srt-win/**/*"
   - "!models/**/*"
 extraFiles:
+  # macOS extraFiles destinations are relative to Contents/; the runtime resolver
+  # looks beside the executable under Contents/MacOS (see external-content-paths.ts).
   - from: prompts
-    to: prompts
+    to: MacOS/prompts
   - from: skills
-    to: skills
+    to: MacOS/defaults/skills
 extraResources:
   - from: resources/components
     to: components

@@ -106,17 +106,18 @@ rustup default stable-x86_64-pc-windows-msvc
 
 ### macOS (experimental)
 
-Cyrene is developed for Windows, but the Electron/TypeScript core (Live2D UI, chat, CyreneHarness, memory) builds and runs unmodified on macOS. After `npm install`, use:
+Cyrene is developed for Windows. The Electron/TypeScript core (Live2D UI, chat, memory) builds and runs unmodified on macOS, but full feature parity — including agent shell execution — is not there yet. After `npm install`, use:
 
 ```bash
 npm run dev            # run in dev mode
 npm run package:mac:dir # build an unsigned Cyrene.app under release/mac-arm64 (or mac/ on Intel)
 ```
 
-Known gaps versus Windows, since these features are implemented against Win32 APIs or ship Windows-only binaries:
+Known gaps versus Windows:
 
+- **Agent shell execution (`run_shell`)** — unsupported on macOS: the default shell resolves to `cmd.exe`, and the `bash` option only searches for `bash.exe` (Git Bash on Windows), never macOS's `/bin/bash`. Agent tasks that need shell commands will fail with `BASH_UNAVAILABLE`. POSIX shell resolution isn't implemented yet.
 - **Screenshot tool** — `native/cyrene-screenshot` is a Rust helper built entirely on DXGI/GDI/Direct2D/Win32 clipboard APIs; it is not spawned on macOS and the feature is disabled (fails gracefully).
-- **Music playback (mpv)** — `prepare:mpv` only fetches a Windows `mpv.exe`; a macOS mpv binary isn't wired up yet.
+- **Music playback (mpv)** — the current `MpvController` playback backend looks for a system-installed `mpv` on macOS/Linux (e.g. via Homebrew: `brew install mpv`); `npm run prepare:mpv` only bundles a Windows `mpv.exe`, so nothing is pre-packaged for macOS. Without a system `mpv`, the music tool returns `client_unavailable`.
 - **Feishu / WeChat iLink / global hotkeys (`nut-js`)** — untested on macOS.
 
 The build is unsigned (no Apple Developer ID), so Gatekeeper will warn on first launch; right-click → Open to bypass.
@@ -396,6 +397,7 @@ If OOM errors continue, use the Chrome DevTools Memory Profiler in development m
 - **Intelligent Stickers** — Includes a built-in sticker panel and semantic matching that can automatically select stickers appropriate to the current context.
 - **Multi-Window Interaction** — The companion, chat, settings, tasks, call, and sticker-management windows are independent while sharing unified runtime state.
 - **Customizable Appearance** — Supports interface themes, chat styles, and font selection.
+- **Character Packs** — Swap the name, personality, avatar, and even the Live2D model for a different character. A generic, IP-free character ships built in and can be switched to instantly; custom packs can be authored and imported as a zip. See the [character pack guide](docs/user-guide/character-packs.md) (Chinese).
 
 #### 💬 Casual Conversation (Chat)
 

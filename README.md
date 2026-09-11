@@ -107,17 +107,18 @@ rustup default stable-x86_64-pc-windows-msvc
 
 ### macOS（实验性支持）
 
-Cyrene 主要面向 Windows 开发，但核心的 Electron/TypeScript 部分（Live2D 界面、对话、CyreneHarness、记忆系统）无需修改代码即可在 macOS 上构建运行。执行 `npm install` 后：
+Cyrene 主要面向 Windows 开发。核心的 Electron/TypeScript 部分（Live2D 界面、对话、记忆系统）无需修改代码即可在 macOS 上构建运行，但尚未达到与 Windows 完全对等的功能覆盖（包括 Agent 的 Shell 执行能力）。执行 `npm install` 后：
 
 ```bash
 npm run dev             # 开发模式运行
 npm run package:mac:dir # 在 release/mac-arm64（Intel 芯片为 mac/）下生成未签名的 Cyrene.app
 ```
 
-以下功能因依赖 Win32 API 或仅打包了 Windows 二进制文件，在 macOS 上暂不可用：
+与 Windows 相比，目前已知的功能差异：
 
+- **Agent Shell 执行（`run_shell`）** — 暂不支持 macOS：默认 Shell 解析为 `cmd.exe`，`bash` 选项也只会查找 Windows 上的 `bash.exe`（Git Bash），不会使用 macOS 的 `/bin/bash`。需要执行 Shell 命令的 Agent 任务会返回 `BASH_UNAVAILABLE` 并失败；POSIX Shell 解析尚未实现。
 - **截图工具** — `native/cyrene-screenshot` 完全基于 DXGI/GDI/Direct2D/Win32 剪贴板 API 实现，在 macOS 上不会启动，功能会优雅降级为禁用。
-- **音乐播放（mpv）** — `prepare:mpv` 目前只下载 Windows 版 `mpv.exe`，尚未接入 macOS 版 mpv 二进制文件。
+- **音乐播放（mpv）** — 当前的 `MpvController` 播放后端在 macOS/Linux 上会查找系统已安装的 `mpv`（例如通过 Homebrew：`brew install mpv`）；`npm run prepare:mpv` 目前只会下载并打包 Windows 版 `mpv.exe`，macOS 上没有预置二进制文件。未安装系统 `mpv` 时，音乐工具会返回 `client_unavailable`。
 - **飞书 / 微信 iLink / 全局快捷键（`nut-js`）** — 尚未在 macOS 上测试。
 
 打包产物未经签名（没有 Apple Developer ID 证书），首次启动会被 Gatekeeper 拦截，右键点击「打开」即可绕过。
@@ -264,6 +265,7 @@ npm run package:win:dir
 - **智能表情包** — 内置贴纸面板，并可通过语义匹配自动选择符合当前语境的表情包。
 - **多窗口交互** — 桌宠、聊天、设置、任务、通话和贴纸管理等界面相互独立，又共享统一运行状态。
 - **个性化外观** — 支持界面主题、聊天样式与字体选择。
+- **角色包（Character Pack）** — 名字、人设、头像乃至 Live2D 模型可整体替换为其他角色，内置示例包开箱即用，也支持导入自制的 zip 角色包；详见[角色包使用说明](docs/user-guide/character-packs.md)。
 
 #### 💬 日常聊天（Chat）
 
