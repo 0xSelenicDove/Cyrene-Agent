@@ -82,9 +82,11 @@ describe("external content lookup", () => {
     const promptDirectory = shippedDirectory("prompts");
     const skillDirectory = shippedDirectory("skills");
     fs.mkdirSync(promptDirectory, { recursive: true });
-    fs.mkdirSync(path.join(skillDirectory, "example"), { recursive: true });
+    const skillAsset = path.join(skillDirectory, "example", "references", "tone.md");
+    fs.mkdirSync(path.dirname(skillAsset), { recursive: true });
     fs.writeFileSync(path.join(promptDirectory, "soul.md"), "shipped soul", "utf8");
     fs.writeFileSync(path.join(skillDirectory, "example", "SKILL.md"), "shipped skill", "utf8");
+    fs.writeFileSync(skillAsset, "shipped tone", "utf8");
 
     const paths = resolveExternalContentPaths({
       isPackaged: true,
@@ -95,6 +97,7 @@ describe("external content lookup", () => {
 
     expect(findPromptPath("soul.md", paths.promptDirectories)).toBe(path.join(promptDirectory, "soul.md"));
     expect(resolveSkillScanSources(paths)).toContainEqual({ directory: skillDirectory, source: "builtin" });
+    expect(findSkillPath("example", "references/tone.md", paths)).toBe(skillAsset);
   });
 
   it("prefers a user prompt and falls back to the shipped prompt", () => {

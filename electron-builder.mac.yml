@@ -24,7 +24,7 @@ extraFiles:
   - from: prompts
     to: MacOS/prompts
   - from: skills
-    to: MacOS/skills
+    to: MacOS/defaults/skills
 extraResources:
   - from: resources/components
     to: components
