@@ -104,6 +104,23 @@ rustup default stable-x86_64-pc-windows-msvc
 >
 > If you install a packaged release directly, you do not need to install Rust or Visual Studio Build Tools.
 
+### macOS (experimental)
+
+Cyrene is developed for Windows, but the Electron/TypeScript core (Live2D UI, chat, CyreneHarness, memory) builds and runs unmodified on macOS. After `npm install`, use:
+
+```bash
+npm run dev            # run in dev mode
+npm run package:mac:dir # build an unsigned Cyrene.app under release/mac-arm64 (or mac/ on Intel)
+```
+
+Known gaps versus Windows, since these features are implemented against Win32 APIs or ship Windows-only binaries:
+
+- **Screenshot tool** — `native/cyrene-screenshot` is a Rust helper built entirely on DXGI/GDI/Direct2D/Win32 clipboard APIs; it is not spawned on macOS and the feature is disabled (fails gracefully).
+- **Music playback (mpv)** — `prepare:mpv` only fetches a Windows `mpv.exe`; a macOS mpv binary isn't wired up yet.
+- **Feishu / WeChat iLink / global hotkeys (`nut-js`)** — untested on macOS.
+
+The build is unsigned (no Apple Developer ID), so Gatekeeper will warn on first launch; right-click → Open to bypass.
+
 ### 1. Clone the Project
 
 ```bash
