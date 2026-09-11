@@ -397,7 +397,6 @@ If OOM errors continue, use the Chrome DevTools Memory Profiler in development m
 - **Intelligent Stickers** — Includes a built-in sticker panel and semantic matching that can automatically select stickers appropriate to the current context.
 - **Multi-Window Interaction** — The companion, chat, settings, tasks, call, and sticker-management windows are independent while sharing unified runtime state.
 - **Customizable Appearance** — Supports interface themes, chat styles, and font selection.
-- **Character Packs** — Swap the name, personality, avatar, and even the Live2D model for a different character. A generic, IP-free character ships built in and can be switched to instantly; custom packs can be authored and imported as a zip. See the [character pack guide](docs/user-guide/character-packs.md) (Chinese).
 
 #### 💬 Casual Conversation (Chat)
 
