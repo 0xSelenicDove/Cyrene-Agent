@@ -106,7 +106,7 @@ rustup default stable-x86_64-pc-windows-msvc
 
 ### macOS (experimental)
 
-Cyrene is developed for Windows, but the Electron/TypeScript core (Live2D UI, chat, CyreneHarness, memory) builds and runs unmodified on macOS. After `npm install`, use:
+Cyrene is developed for Windows. An experimental macOS packaging command is available, but full feature parity is not supported. After `npm install`, use:
 
 ```bash
 npm run dev            # run in dev mode
@@ -115,6 +115,7 @@ npm run package:mac:dir # build an unsigned Cyrene.app under release/mac-arm64 (
 
 Known gaps versus Windows, since these features are implemented against Win32 APIs or ship Windows-only binaries:
 
+- **Agent shell execution (`run_shell`)** — unsupported on macOS: the default shell resolves to `cmd.exe`, and the Bash option searches for `bash.exe`, not macOS `/bin/bash`. Agent tasks that need shell commands will fail. POSIX shell resolution and macOS sandbox integration are not implemented.
 - **Screenshot tool** — `native/cyrene-screenshot` is a Rust helper built entirely on DXGI/GDI/Direct2D/Win32 clipboard APIs; it is not spawned on macOS and the feature is disabled (fails gracefully).
 - **Music playback (mpv)** — `prepare:mpv` only fetches a Windows `mpv.exe`; a macOS mpv binary isn't wired up yet.
 - **Feishu / WeChat iLink / global hotkeys (`nut-js`)** — untested on macOS.

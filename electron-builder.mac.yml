@@ -20,10 +20,11 @@ files:
   - "!vendor/cyrene-skills/**/*"
   - "!models/**/*"
 extraFiles:
+  # macOS extraFiles are relative to Contents; runtime looks beside Contents/MacOS/Cyrene.
   - from: prompts
-    to: prompts
+    to: MacOS/prompts
   - from: skills
-    to: skills
+    to: MacOS/defaults/skills
 extraResources:
   - from: resources/components
     to: components

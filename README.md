@@ -107,7 +107,7 @@ rustup default stable-x86_64-pc-windows-msvc
 
 ### macOS（实验性支持）
 
-Cyrene 主要面向 Windows 开发，但核心的 Electron/TypeScript 部分（Live2D 界面、对话、CyreneHarness、记忆系统）无需修改代码即可在 macOS 上构建运行。执行 `npm install` 后：
+Cyrene 主要面向 Windows 开发，目前提供实验性的 macOS 打包命令，尚未支持 Windows 版本的全部功能。执行 `npm install` 后：
 
 ```bash
 npm run dev             # 开发模式运行
@@ -116,6 +116,7 @@ npm run package:mac:dir # 在 release/mac-arm64（Intel 芯片为 mac/）下生�
 
 以下功能因依赖 Win32 API 或仅打包了 Windows 二进制文件，在 macOS 上暂不可用：
 
+- **Agent Shell 执行（`run_shell`）** — 暂不支持 macOS：默认 Shell 使用 `cmd.exe`，Bash 选项只查找 `bash.exe`，不会使用 macOS 的 `/bin/bash`。需要执行 Shell 命令的 Agent 任务会失败；POSIX Shell 解析和 macOS 沙箱集成尚未实现。
 - **截图工具** — `native/cyrene-screenshot` 完全基于 DXGI/GDI/Direct2D/Win32 剪贴板 API 实现，在 macOS 上不会启动，功能会优雅降级为禁用。
 - **音乐播放（mpv）** — `prepare:mpv` 目前只下载 Windows 版 `mpv.exe`，尚未接入 macOS 版 mpv 二进制文件。
 - **飞书 / 微信 iLink / 全局快捷键（`nut-js`）** — 尚未在 macOS 上测试。
