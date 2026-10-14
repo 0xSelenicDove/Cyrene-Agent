@@ -326,30 +326,63 @@ describe("shell job SQLite lifecycle (isolated data, mocked processes)", () => {
   });
 });
 
+it.each([false, true])("drains cold historical cleanup before shutdown (cancelled=%s)", async cancelled => {
+  const old = record("expired", { status: "exited", exitCode: 0, endedAtMs: Date.now() - 8 * 86400000 });
+  await database().call("shellJobs.create", old);
+  fs.writeFileSync(old.logFile, "expired");
+  let release!: () => void, entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const arrived = new Promise<void>(resolve => { entered = resolve; });
+  const rm = fs.promises.rm.bind(fs.promises);
+  vi.spyOn(fs.promises, "rm").mockImplementation(async (file, options) => {
+    if (file === old.logFile) { entered(); await gate; }
+    return rm(file, options);
+  });
+  const abort = new AbortController();
+  const query = manager.waitForShellJob(old.jobId, 0, abort.signal).catch(error => error);
+  await arrived;
+  if (cancelled) { abort.abort(); expect(await query).toMatchObject({ name: "AbortError" }); }
+  let stopped = false;
+  const shutdown = manager.disposeAllShellJobs().then(() => { stopped = true; });
+  try {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(stopped).toBe(false);
+    await expect(manager.waitForShellJob("new-query", 0)).rejects.toThrow("SHELL_JOBS_STOPPING");
+  } finally { release(); await shutdown; }
+  if (!cancelled) expect(await query).toMatchObject({ message: "SHELL_JOBS_STOPPING" });
+  expect(await database().call("shellJobs.get", old.jobId)).toBeNull();
+  await closeConversationDatabases();
+  const call = vi.spyOn(database(), "call");
+  await expect(manager.stopShellJob(old.jobId)).rejects.toThrow("SHELL_JOBS_STOPPING");
+  expect(call).not.toHaveBeenCalled();
+});
+
 it.each(["upstream-v7", "memory-v8", "shell-draft-v8"])("upgrades %s without losing existing data, then reopens", async version => {
   const client = database();
   await client.call("shellJobs.get", "fixture");
   await client.close();
   const sqlite = new DatabaseSync(path.join(mocks.root, "cyrene.sqlite"));
-  sqlite.exec("DELETE FROM schema_migrations WHERE version=9");
-  if (version === "shell-draft-v8") {
-    sqlite.exec("INSERT INTO schema_migrations VALUES(8)");
-  } else {
-    sqlite.exec("DROP TABLE shell_jobs");
-    if (version === "memory-v8") {
-      // The independent memory PR owns migration 8; shell migration 9 must not skip or overwrite it.
-      sqlite.exec(`CREATE TABLE memory_scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1), legacy_count INTEGER NOT NULL);
-        CREATE TABLE memory_pending_turns(seq INTEGER PRIMARY KEY AUTOINCREMENT,
-          conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-          user_turn_id TEXT NOT NULL, user_entry_id TEXT NOT NULL, assistant_entry_id TEXT NOT NULL,
-          payload_json TEXT, active INTEGER NOT NULL, processed INTEGER NOT NULL,
-          UNIQUE(conversation_id,user_turn_id));
-        CREATE INDEX memory_pending_batch ON memory_pending_turns(conversation_id,active,processed,seq);
-        INSERT INTO schema_migrations VALUES(8);
-        INSERT INTO memory_scheduler_state VALUES(1,123)`);
+  try {
+    // 从目标历史 schema 建 fixture，不依赖当前构建是否已包含独立的记忆迁移 8。
+    sqlite.exec("DELETE FROM schema_migrations WHERE version IN (8,9); DROP TABLE IF EXISTS memory_pending_turns; DROP TABLE IF EXISTS memory_scheduler_state;");
+    if (version === "shell-draft-v8") {
+      sqlite.exec("INSERT INTO schema_migrations VALUES(8)");
+    } else {
+      sqlite.exec("DROP TABLE shell_jobs");
+      if (version === "memory-v8") {
+        // The independent memory PR owns migration 8; shell migration 9 must not skip or overwrite it.
+        sqlite.exec(`CREATE TABLE memory_scheduler_state(id INTEGER PRIMARY KEY CHECK(id=1), legacy_count INTEGER NOT NULL);
+          CREATE TABLE memory_pending_turns(seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            user_turn_id TEXT NOT NULL, user_entry_id TEXT NOT NULL, assistant_entry_id TEXT NOT NULL,
+            payload_json TEXT, active INTEGER NOT NULL, processed INTEGER NOT NULL,
+            UNIQUE(conversation_id,user_turn_id));
+          CREATE INDEX memory_pending_batch ON memory_pending_turns(conversation_id,active,processed,seq);
+          INSERT INTO schema_migrations VALUES(8);
+          INSERT INTO memory_scheduler_state VALUES(1,123)`);
+      }
     }
-  }
-  sqlite.close();
+  } finally { sqlite.close(); }
   const { jobId } = await manager.startShellJob(options());
   child.emit("close", 0);
   await manager.stopShellJob(jobId);

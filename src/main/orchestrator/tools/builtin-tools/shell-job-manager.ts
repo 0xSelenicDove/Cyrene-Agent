@@ -227,8 +227,10 @@ function recordOf(job: ShellJobRecord): ShellJobRecord {
 
 async function savedSnapshot(jobId: string, signal?: AbortSignal): Promise<ShellJobSnapshot | null> {
   signal?.throwIfAborted();
+  if (stopping) throw new Error("SHELL_JOBS_STOPPING");
   await raceWithSignal(initializeJobs(), signal);
   signal?.throwIfAborted();
+  if (stopping) throw new Error("SHELL_JOBS_STOPPING");
   const record = await raceWithSignal(database().call<ShellJobRecord | null>("shellJobs.get", jobId), signal);
   if (!record) return null;
   if (record.reason === "app_restarted_execution_unknown") {
@@ -422,7 +424,8 @@ export async function disposeAllShellJobs(): Promise<void> {
     }
   }
   const writes = [...jobs.values()].map(persistTerminal);
-  await Promise.allSettled([...starting]);
+  // 历史查询取消只结束调用方等待；其共享初始化/日志清理必须在数据库关闭前收尾。
+  await Promise.allSettled([ready, ...starting]);
   const results = await Promise.allSettled(writes);
   const errors = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
   if (errors.length) throw new AggregateError(errors.map(result => result.reason), "SHELL_JOB_PERSISTENCE_FAILED");
