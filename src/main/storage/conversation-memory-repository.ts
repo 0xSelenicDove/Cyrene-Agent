@@ -6,12 +6,24 @@ import type { MemoryPendingStore, PendingMemoryBatch, PendingMemoryTurn } from "
 function activeSources(database: ConversationDatabase, id: string): Map<string, { userEntryId: string; assistantEntryId: string }> {
   const sources = new Map<string, { userEntryId: string; assistantEntryId: string }>();
   if (database.db.prepare('SELECT deleted FROM conversations WHERE id=?').get(id)?.deleted) return sources;
-  const nodes = reduceTranscriptProjection(database.entries(id, true)).state?.nodes ?? [];
+  const entries = database.entries(id, true);
+  const nodes = reduceTranscriptProjection(entries).state?.nodes ?? [];
+  const entryRuns = new Map(entries.map(entry => [entry.id, entry.runId]));
+  const users = new Map(nodes.filter(node => node.kind === 'user' && node.turnId).map(node => [node.turnId!, node]));
+  const runUsers = new Map<string, string>();
+  for (const row of database.db.prepare('SELECT run_id,dispatch_json,payload_json FROM conversation_requests WHERE conversation_id=? AND run_id IS NOT NULL').all(id)) {
+    const facts = JSON.parse((row.dispatch_json ?? row.payload_json) as string);
+    const turnId = facts.currentUser?.turnId ?? facts.turnId;
+    if (turnId) runUsers.set(row.run_id as string, turnId);
+  }
   let user: (typeof nodes)[number] | undefined;
   for (const node of nodes) {
     if (node.kind === 'user') user = node;
-    else if (node.kind === 'assistant' && user?.turnId) {
-      sources.set(user.turnId, { userEntryId: user.entryId, assistantEntryId: node.entryId });
+    else if (node.kind === 'assistant') {
+      // 插话也是 user 条目，但回复仍属于发起该 run 的用户；旧轨迹没有请求回执时沿用相邻关系。
+      const origin = runUsers.get(entryRuns.get(node.entryId) ?? '');
+      const source = origin ? users.get(origin) : user;
+      if (source?.turnId) sources.set(source.turnId, { userEntryId: source.entryId, assistantEntryId: node.entryId });
     }
   }
   return sources;
