@@ -533,17 +533,17 @@ MIT 仅约束本仓库的源代码，不适用于角色、Live2D 模型与美术
                 </a>
             </td>
             <td align="center">
-                <a href="https://github.com/LZhWi">
-                    <img src="https://avatars.githubusercontent.com/u/306725149?v=4" width="48;" alt="LZhWi"/>
-                    <br />
-                    <sub><b>LZhWi</b></sub>
-                </a>
-            </td>
-            <td align="center">
                 <a href="https://github.com/Unknownuserfrommars">
                     <img src="https://avatars.githubusercontent.com/u/163658509?v=4" width="48;" alt="Unknownuserfrommars"/>
                     <br />
                     <sub><b>Tianzzi</b></sub>
+                </a>
+            </td>
+            <td align="center">
+                <a href="https://github.com/LZhWi">
+                    <img src="https://avatars.githubusercontent.com/u/306725149?v=4" width="48;" alt="LZhWi"/>
+                    <br />
+                    <sub><b>LZhWi</b></sub>
                 </a>
             </td>
             <td align="center">
