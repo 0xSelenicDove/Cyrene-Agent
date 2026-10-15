@@ -48,6 +48,14 @@ async function click(selector: string, scope: ParentNode = document) {
   await act(async () => element!.click());
 }
 
+async function waitForFocus(element: Element | null): Promise<void> {
+  // 弹层卸载后的焦点恢复可能在下一轮定时器执行，等待实际焦点而非 click 的 act 返回。
+  const deadline = Date.now() + 1_000;
+  while (document.activeElement !== element && Date.now() < deadline) {
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 20)); });
+  }
+}
+
 describe("workspace preview lifecycle", () => {
   it.each([image, svg])("closes $kind zoom back to its workspace preview", async (preview) => {
     await render(preview);
@@ -56,6 +64,7 @@ describe("workspace preview lifecycle", () => {
     await click(preview.kind === "image" ? ".cy-generated-image-preview__close" : ".ant-modal-close");
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(host.querySelector(".cy-workspace-preview__zoom")).not.toBeNull();
+    await waitForFocus(host.querySelector(".cy-workspace-preview__zoom"));
     expect(document.activeElement).toBe(host.querySelector(".cy-workspace-preview__zoom"));
   });
 
