@@ -1,3 +1,4 @@
+import { WorkspacePreviewContext, type WorkspacePreview } from "../components/WorkspacePreview";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Globe, MessageSquareText } from "lucide-react";
 import { useTranslation } from "../../../i18n";
@@ -186,6 +187,13 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
   const [browserTabOpen, setBrowserTabOpen] = useState(() => localStorage.getItem("cyrene.browser-panel.open") === "1");
   /** 右侧面板当前激活的标签 ID（files / file:... / diff:... / plan:...），null 时面板取第一个标签 */
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [preview, setPreview] = useState<WorkspacePreview | null>(null);
+  const previewReturnTab = useRef<string | null>(null);
+  const openWorkspacePreview = useCallback((next: WorkspacePreview) => {
+    if (activeTabId !== "preview") previewReturnTab.current = activeTabId;
+    setPreview(next);
+    setActiveTabId("preview");
+  }, [activeTabId]);
   useEffect(() => {
     localStorage.setItem("cyrene.browser-panel.open", browserTabOpen ? "1" : "0");
   }, [browserTabOpen]);
@@ -426,6 +434,10 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
 
   const activeSessionId = activeSessionIds[mode];
   const scopeKey = activeSessionId ?? `mode:${mode}`;
+  useEffect(() => {
+    setPreview(null);
+    setActiveTabId((id) => id === "preview" ? null : id);
+  }, [scopeKey]);
   const draft = drafts[scopeKey] ?? "";
   const messages = activeSessionId ? (messagesBySession[activeSessionId] ?? []) : [];
   const activeInteraction = sessionInteraction(interactionsBySession, activeSessionId);
@@ -1736,6 +1748,7 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
 
   /** 收起右侧面板：关闭全部标签（再次点击开关可重新展开文件树） */
   const collapseInspector = () => {
+    setPreview(null);
     setFilesTabOpen(false);
     setBrowserTabOpen(false);
     setFileTabs([]);
@@ -1772,8 +1785,9 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
   /** 计划标签 ID：会话内唯一（计划内容始终跟随当前会话） */
   const planTabId = `plan:${activeSessionId ?? "session"}`;
 
-  /** 右侧面板标签固定顺序：浏览器 → 文件树 → 文件预览 → Diff → 子任务 → 计划 */
+  /** 右侧面板标签固定顺序：图片/图表预览 → 浏览器 → 文件树 → 文件预览 → Diff → 子任务 → 计划 */
   const inspectorTabIds = [
+    ...(preview ? ["preview"] : []),
     ...(browserTabOpen ? ["browser"] : []),
     ...(filesTabOpen ? ["files"] : []),
     ...fileTabs.map((tab) => tab.id),
@@ -1800,7 +1814,9 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
       return;
     }
     const remaining = inspectorTabIds.filter((tabId) => tabId !== id);
-    if (id === "files") {
+    if (id === "preview") {
+      setPreview(null);
+    } else if (id === "files") {
       setFilesTabOpen(false);
     } else if (id === "browser") {
       setBrowserTabOpen(false);
@@ -1814,7 +1830,10 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
       setDiffTabs((tabs) => tabs.filter((tab) => tab.id !== id));
     }
     if (activeTabId === id) {
-      setActiveTabId(remaining[index - 1] ?? remaining[index] ?? null);
+      const returnToPreviewOrigin = id === "preview" && remaining.includes(previewReturnTab.current ?? "");
+      setActiveTabId(returnToPreviewOrigin
+        ? previewReturnTab.current
+        : remaining[index - 1] ?? remaining[index] ?? null);
     }
   };
 
@@ -1889,6 +1908,7 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
   }, [onOpenSettings]);
 
   return (
+    <WorkspacePreviewContext.Provider value={openWorkspacePreview}>
     <div ref={pageRef} className="cy-page cy-page--chat">
       <ChatPageNavigation
         activePanel={activePanel}
@@ -2201,6 +2221,7 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
             <Separator className="cy-dock-separator" />
             <Panel id="inspector" defaultSize="45" minSize={320} maxSize="70%" className="cy-dock-body">
               <ChatPageInspector
+                preview={preview}
                 sessionId={activeSessionId}
                 workspaceRoot={activeSession?.workspaceBinding?.workspaceRoot}
                 filesTabOpen={filesTabOpen}
@@ -2223,5 +2244,6 @@ export function ChatPage({ onOpenSettings, scheduledTasksNavigation = 0 }: { onO
         )}
       </Group>
     </div>
+    </WorkspacePreviewContext.Provider>
   );
 }
