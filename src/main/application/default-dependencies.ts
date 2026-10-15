@@ -72,7 +72,6 @@ import { clearLegacyStickerEmbeddingCache, loadStickerTextIndex } from "../stick
 import { toolRegistry } from "../orchestrator/tools/registry/tool-registry";
 import { pluginPromptRegistry } from "../../plugins/prompts";
 import type { PluginManager } from "../../plugins/manager";
-import { setLive2dWindowSender } from "../orchestrator/tools/built-in-tools";
 import { registerAllTools } from "../orchestrator/tools/registry/tool-registration";
 import { LspManager } from "../lsp/manager";
 import { initSandbox } from "../orchestrator/sandbox/sandbox-exec";
@@ -430,9 +429,6 @@ export function createDefaultApplicationDependencies(): ApplicationDependencies 
           dateLocale: generalSettings.language,
           asrLanguage: generalSettings.asrLanguage,
         });
-
-        // Live2D 桌宠窗口发送器
-        setLive2dWindowSender((channel, payload) => shell.windowManager.sendToPetWindow(channel, payload));
 
         // Git：服务对象预创建；仓库监听只在打开仓库后启动
         // 探测结果在进程内缓存：成功过一次就不再重复探测，避免启动高峰期
