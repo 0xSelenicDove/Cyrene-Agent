@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { InteractionController } from "./interaction";
 import { describe, expect, it, vi } from "vitest";
 
@@ -122,6 +122,9 @@ describe("retained click actions", () => {
         const [group, name] = area.Motion.split(":");
         const def = definitions[group].find((d: {Name: string}) => d.Name === name);
         expect(def.File).toBeUndefined();
+        expect(mgr.getHitAreaDefs().find((hit) => hit.name === area.Name)).toMatchObject({
+          motionIndex: definitions[group].indexOf(def), expressionName: def.Expression,
+        });
         trigger.mockClear(); model.expression.mockClear();
         callbacks.get("pointerdown")!({clientX: 10, clientY: 10});
         callbacks.get("pointerup")!({clientX: 10, clientY: 10});
@@ -130,5 +133,20 @@ describe("retained click actions", () => {
       }
     } finally { interaction.dispose(); mgr.dispose(); vi.unstubAllGlobals(); }
     expect(callbacks.size).toBe(0);
+  });
+});
+
+describe("模型资源路径", () => {
+  it("所有动作 URL 无片段且能定位实际文件", () => {
+    const modelUrl = new URL("../public/models/cyrene/Cyrene.model3.json", import.meta.url);
+    const json = JSON.parse(readFileSync(modelUrl, "utf8"));
+    for (const entries of Object.values(json.FileReferences.Motions) as Array<Array<{ File?: string }>>) {
+      for (const entry of entries) {
+        if (!entry.File) continue;
+        const resource = new URL(entry.File, modelUrl);
+        expect(resource.hash).toBe("");
+        expect(existsSync(resource)).toBe(true);
+      }
+    }
   });
 });

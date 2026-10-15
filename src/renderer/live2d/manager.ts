@@ -42,13 +42,13 @@ interface MotionEntry {
 
 interface ModelJsonShape {
   HitAreas?: { Name?: string; Id?: string; Motion?: string }[];
-  Motions?: Record<string, MotionEntry[]>;
+  FileReferences?: { Motions?: Record<string, MotionEntry[]> };
 }
 
 function buildHitAreaDefs(json: ModelJsonShape): HitAreaDef[] {
   const out: HitAreaDef[] = [];
   const hitAreas = json.HitAreas ?? [];
-  const motions = json.Motions ?? {};
+  const motions = json.FileReferences?.Motions ?? {};
   for (const area of hitAreas) {
     const name = area.Name;
     const id = area.Id;
