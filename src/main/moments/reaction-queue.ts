@@ -14,6 +14,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { renameWithRetrySync } from "../storage/rename-with-retry";
 
 // ── 任务与决策类型 ──────────────────────────────────────────────
 
@@ -328,14 +329,20 @@ export function createReactionQueue(deps: ReactionQueueDeps): ReactionQueue {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const tmp = target + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify({ tasks }, null, 2), "utf8");
-    fs.renameSync(tmp, target);
+    renameWithRetrySync(tmp, target);
   }
 
   function removeTask(taskId: string): void {
     const index = tasks!.findIndex((task) => task.id === taskId);
     if (index >= 0) {
-      tasks!.splice(index, 1);
-      persist();
+      const [removed] = tasks!.splice(index, 1);
+      try {
+        persist();
+      } catch (error) {
+        // 落盘失败时保留内存任务，下一轮才能重试已落盘的决策。
+        tasks!.splice(index, 0, removed);
+        throw error;
+      }
     }
   }
 

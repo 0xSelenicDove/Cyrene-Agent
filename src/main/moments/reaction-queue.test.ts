@@ -5,6 +5,11 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { describe, expect, it, vi } from "vitest";
+import * as atomicRename from "../storage/rename-with-retry";
+
+vi.mock("../storage/rename-with-retry", async (original) => ({
+  ...await original<typeof import("../storage/rename-with-retry")>(),
+}));
 import {
   applyNightWindow,
   computeCharacterPostDelayMs,
@@ -83,6 +88,33 @@ function makeQueue(options: {
 }
 
 describe("反应队列持久化与执行", () => {
+  it("retries removal in the same process after persistence fails without deciding again", async () => {
+    const filePath = tempQueueFile();
+    const harness = makeQueue({ filePath });
+    const task = harness.queue.enqueue({ kind: "post_eval", actor: "cyrene", postId: "post-1" });
+    const originalRename = atomicRename.renameWithRetrySync;
+    const rename = vi.spyOn(atomicRename, "renameWithRetrySync").mockImplementation((source, target) => {
+      if (target === filePath && JSON.parse(fs.readFileSync(source, "utf8")).tasks.length === 0) {
+        throw Object.assign(new Error("target still busy"), { code: "EPERM" });
+      }
+      originalRename(source, target);
+    });
+    try {
+      await harness.queue.drainOnce();
+      expect(harness.queue.list().map(item => item.id)).toEqual([task!.id]);
+      expect(JSON.parse(fs.readFileSync(filePath, "utf8")).tasks).toHaveLength(1);
+      expect(harness.decide).toHaveBeenCalledTimes(1);
+      rename.mockRestore();
+      await harness.queue.drainOnce();
+      expect(harness.queue.list()).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(filePath, "utf8")).tasks).toEqual([]);
+      expect(harness.decide).toHaveBeenCalledTimes(1);
+    } finally {
+      rename.mockRestore();
+      fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+    }
+  });
+
   it("入队即落盘，重启后从磁盘恢复未完成任务", () => {
     const filePath = tempQueueFile();
     const first = makeQueue({ filePath, now: 5_000 });
