@@ -14,7 +14,15 @@ vi.mock("./ChatMessageList", () => ({
   MarkdownContent: ({ content }: { content: string }) => createElement("span", null, content),
 }));
 
-const deferredText = "用户选择暂不提供本题信息。这不代表用户不知道，也不是该问题的实际答案。请根据已有信息判断能否继续，不要自行推断用户未提供的内容。";
+const deferredText = "用户选择暂不回答本题。";
+const localizedDeferAnswers = [
+  { locale: "zh-CN", label: "暂不回答", text: deferredText },
+  { locale: "en", label: "Skip for now", text: "The user chose to skip this question for now." },
+  { locale: "ja-JP", label: "今は回答しない", text: "ユーザーはこの質問への回答を保留しました。" },
+];
+const localizedDeferSubmissions = localizedDeferAnswers.flatMap((answer) =>
+  [false, true].map((deferAll) => ({ ...answer, deferAll })),
+);
 const textQuestion = (id: string): AskUserQuestion => ({
   id, question: `Question ${id}`, options: [], allowCustomInput: true,
 });
@@ -192,23 +200,39 @@ describe("AskUserPanel 暂不回答", () => {
     expect(host.querySelectorAll(".cy-plan-approval__decisions button")).toHaveLength(3);
   });
 
-  it("切换中英日界面只改变按钮文案，固定回答内容保持一致", () => {
+  it.each(localizedDeferAnswers)("$locale 界面显示并提交对应语言的暂不回答内容", ({ locale, label, text }) => {
     render();
-    for (const [locale, label] of [["zh-CN", "暂不回答"], ["en", "Skip for now"], ["ja-JP", "今は回答しない"]]) {
-      act(() => setUiLocale(locale));
-      input("");
-      click(button(label));
-      expect(customInput().value).toBe(deferredText);
-      click(submitButton());
-      expect(onAnswer).toHaveBeenLastCalledWith({
-        interactionId: "ask-1", runId: "run-1", revision: 2,
-        answers: [{ questionId: "first", source: "custom", text: deferredText }],
-      });
-    }
-    expect(onAnswer).toHaveBeenCalledTimes(3);
+    act(() => setUiLocale(locale));
+    click(button(label));
+    expect(customInput().value).toBe(text);
+    expect(onAnswer).not.toHaveBeenCalled();
+    click(submitButton());
+    expect(onAnswer).toHaveBeenCalledExactlyOnceWith({
+      interactionId: "ask-1", runId: "run-1", revision: 2,
+      answers: [{ questionId: "first", source: "custom", text }],
+    });
   });
 
-  it.each([false, true])("真实发布、DOM 提交和工具回包保留暂不回答语义（全部暂不回答=%s）", async (deferAll) => {
+  it("切换界面语言不会覆盖已写入或经用户编辑的回答草稿", () => {
+    render();
+    click(button("暂不回答"));
+    act(() => setUiLocale("en"));
+    expect(host.textContent).toContain("Skip for now");
+    expect(customInput().value).toBe(deferredText);
+
+    input("I will provide more details later.");
+    act(() => setUiLocale("ja-JP"));
+    expect(host.textContent).toContain("今は回答しない");
+    expect(customInput().value).toBe("I will provide more details later.");
+    click(submitButton());
+    expect(onAnswer).toHaveBeenCalledExactlyOnceWith({
+      interactionId: "ask-1", runId: "run-1", revision: 2,
+      answers: [{ questionId: "first", source: "custom", text: "I will provide more details later." }],
+    });
+  });
+
+  it.each(localizedDeferSubmissions)("$locale 真实发布、DOM 提交和工具回包保留暂不回答内容（全部暂不回答=$deferAll）", async ({ locale, label, text, deferAll }) => {
+    act(() => setUiLocale(locale));
     const result = await executeAskUser({
       id: "tool-1", name: "ask_user",
       arguments: JSON.stringify({ questions: [
@@ -226,10 +250,11 @@ describe("AskUserPanel 暂不回答", () => {
       expect(normalized).toBeDefined();
       render(normalized!);
       expect(host.textContent).toContain("Markdown（推荐）");
-      if (deferAll) click(button("暂不回答"));
+      if (deferAll) click(button(label));
       else click(options()[0]);
       expect(page()).toBe("2 / 2");
-      click(button("暂不回答"));
+      click(button(label));
+      expect(customInput().value).toBe(text);
       expect(onAnswer).not.toHaveBeenCalled();
       click(submitButton());
       expect(onAnswer).toHaveBeenCalledTimes(1);
@@ -239,9 +264,9 @@ describe("AskUserPanel 暂不回答", () => {
     expect(result.outcome).toBe("success");
     expect(JSON.parse(result.output ?? "null")).toEqual({ answers: [
       deferAll
-        ? { questionId: "format", customInput: deferredText }
+        ? { questionId: "format", customInput: text }
         : { questionId: "format", selectedValues: ["markdown"], selectedLabels: ["Markdown（推荐）"] },
-      { questionId: "note", customInput: deferredText },
+      { questionId: "note", customInput: text },
     ] });
     expect(result.message).not.toContain("用户未在时限内回答问题");
   });

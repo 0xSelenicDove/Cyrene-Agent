@@ -25,9 +25,6 @@ import moodCompanyUrl from "../../../assets/status-moods/陪伴中.png?url";
 import moodSpoiledUrl from "../../../assets/status-moods/撒娇.png?url";
 import moodLearnUrl from "../../../assets/status-moods/学习.png?url";
 
-// 明确传达用户暂不提供信息，避免把这一选择解释成知识不足或实际答案。
-const DEFERRED_ANSWER_TEXT = "用户选择暂不提供本题信息。这不代表用户不知道，也不是该问题的实际答案。请根据已有信息判断能否继续，不要自行推断用户未提供的内容。";
-
 function PanelShell({ children, title, onCollapse }: { children: ReactNode; title: string; onCollapse?: () => void }) {
   const { t } = useTranslation();
   return (
@@ -239,7 +236,8 @@ export function AskUserPanel({
             type="button"
             disabled={disabled}
             onClick={() => {
-              setDrafts((values) => updateAskCustomText(values, current.id, DEFERRED_ANSWER_TEXT));
+              const deferredAnswerText = t("interaction.deferredAnswerText");
+              setDrafts((values) => updateAskCustomText(values, current.id, deferredAnswerText));
               setPage((value) => Math.min(questions.length - 1, value + 1));
             }}
           >{t("interaction.deferAnswer")}</button>
