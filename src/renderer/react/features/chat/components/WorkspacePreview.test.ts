@@ -70,7 +70,7 @@ describe("workspace preview lifecycle", () => {
     await waitForClose(host.querySelector(".cy-workspace-preview__zoom"));
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(host.querySelector(".cy-workspace-preview__zoom")).not.toBeNull();
-    expect(document.activeElement).toBe(host.querySelector(".cy-workspace-preview__zoom"));
+    await vi.waitFor(() => expect(document.activeElement).toBe(host.querySelector(".cy-workspace-preview__zoom")));
   });
 
   it.each([image, svg])("removes $kind zoom immediately when its tab becomes inactive", async (preview) => {
