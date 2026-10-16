@@ -294,6 +294,7 @@ export function createReactionQueue(deps: ReactionQueueDeps): ReactionQueue {
   // 惰性加载：首次入队/扫描才读盘。service 在 import 期构造队列，
   // 那一刻不该有磁盘副作用；真正的"启动加载"发生在扫描器首轮补扫。
   let tasks: ReactionTask[] | null = null;
+  const pendingDeletion = new WeakSet<ReactionTask>();
   let resolvedPath: string | null = null;
   let draining = false;
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -338,8 +339,10 @@ export function createReactionQueue(deps: ReactionQueueDeps): ReactionQueue {
       const [removed] = tasks!.splice(index, 1);
       try {
         persist();
+        pendingDeletion.delete(removed);
       } catch (error) {
-        // 落盘失败时保留内存任务，下一轮才能重试已落盘的决策。
+        // 任务已完成；落盘失败后只重试删除，不再决策或重复执行副作用。
+        pendingDeletion.add(removed);
         tasks!.splice(index, 0, removed);
         throw error;
       }
@@ -355,11 +358,15 @@ export function createReactionQueue(deps: ReactionQueueDeps): ReactionQueue {
       removeTask(task.id);
     } catch (error) {
       log("reaction_apply_failed", { taskId: task.id, actor: task.actor, error: String(error) });
-      // 决策已落盘：保留任务，下轮扫描直接重放该决策（store 幂等吸收重复写入）
+      // 执行失败则重放已落盘决策；仅删除失败则下轮只重试删除。
     }
   }
 
   async function execute(task: ReactionTask): Promise<void> {
+    if (pendingDeletion.has(task)) {
+      removeTask(task.id);
+      return;
+    }
     // 纯随机点赞零模型成本：到期复核后直接落库，点赞唯一性天然幂等
     if (task.kind === "auto_like") {
       await applyAndRemove(task, { action: "like" });
