@@ -25,6 +25,31 @@ afterEach(() => {
 });
 
 describe("native browser dialog occlusion", () => {
+  it("ignores an explicitly non-modal card while still hiding for a modal", async () => {
+    const changes = observe();
+    const card = dialog();
+    card.setAttribute("aria-modal", "false");
+    document.body.append(card);
+    await mutations();
+    expect(changes.mock.calls).toEqual([[false]]);
+    const modal = dialog();
+    document.body.append(modal);
+    await mutations();
+    modal.remove();
+    await mutations();
+    expect(changes.mock.calls).toEqual([[false], [true], [false]]);
+    expect(card.isConnected).toBe(true);
+  });
+  it("updates when an open dialog changes its modal semantics", async () => {
+    const card = dialog();
+    document.body.append(card);
+    const changes = observe();
+    card.setAttribute("aria-modal", "false");
+    await mutations();
+    card.removeAttribute("aria-modal");
+    await mutations();
+    expect(changes.mock.calls).toEqual([[true], [false], [true]]);
+  });
   it("detects a dialog already open before the browser mounts", () => {
     document.body.append(dialog());
     expect(observe().mock.calls).toEqual([[true]]);

@@ -10,7 +10,8 @@ export function observeDialogOcclusion(onChange: (occluded: boolean) => void): (
   let previous: boolean | undefined;
   const update = () => {
     const occluded = Array.from(document.querySelectorAll(DIALOG_SELECTOR)).some((dialog) =>
-      dialog.getClientRects().length > 0 && getComputedStyle(dialog).visibility !== "hidden",
+      dialog.getAttribute("aria-modal") !== "false"
+        && dialog.getClientRects().length > 0 && getComputedStyle(dialog).visibility !== "hidden",
     );
     if (occluded !== previous) {
       previous = occluded;
@@ -28,7 +29,7 @@ export function observeDialogOcclusion(onChange: (occluded: boolean) => void): (
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ["role", "class", "style", "hidden", "open"],
+    attributeFilter: ["role", "aria-modal", "class", "style", "hidden", "open"],
   });
   update();
   return () => observer.disconnect();
