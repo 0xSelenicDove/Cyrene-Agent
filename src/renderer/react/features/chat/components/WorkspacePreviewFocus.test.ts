@@ -6,13 +6,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspacePreviewContent, type WorkspacePreview } from "./WorkspacePreview";
 
 vi.mock("../../../i18n", () => ({ t: (key: string) => key, useTranslation: () => ({ t: (key: string) => key }) }));
-const closing = vi.hoisted(() => ({ afterClose: undefined as (() => void) | undefined }));
+const closing = vi.hoisted(() => ({
+  afterClose: undefined as (() => void) | undefined,
+  completed: [] as Array<() => void>,
+}));
 vi.mock("./SvgPreviewModal", async importOriginal => {
   const actual = await importOriginal<typeof import("./SvgPreviewModal")>();
   return { ...actual, SvgPreviewModal: (props: React.ComponentProps<typeof actual.SvgPreviewModal>) => {
     // 保留真实 Modal 和焦点锁，捕获回调以模拟关闭完成通知的延迟交付。
     closing.afterClose = props.afterClose;
-    return createElement(actual.SvgPreviewModal, props);
+    const afterClose = props.afterClose;
+    return createElement(actual.SvgPreviewModal, { ...props, afterClose: () => {
+      if (afterClose) { closing.completed.push(afterClose); afterClose(); }
+    } });
   } };
 });
 const svg: WorkspacePreview = { kind: "svg", svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>fixture</text></svg>' };
@@ -24,6 +30,7 @@ let host: HTMLDivElement;
 let root: Root;
 beforeEach(() => {
   closing.afterClose = undefined;
+  closing.completed.length = 0;
   vi.stubGlobal("React", React);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   // JSDOM 默认零尺寸会让 Ant Design 的焦点锁找不到目标，掩盖浏览器中的回拉。
@@ -82,6 +89,30 @@ describe("workspace preview focus after dialog cleanup", () => {
     expect(focus).not.toHaveBeenCalled();
     await click(".ant-modal-close");
     await waitFor(() => !document.querySelector('[role="dialog"]') && document.activeElement === host.querySelector(".cy-workspace-preview__zoom"));
+  });
+  it("ignores the first close completion during a second close of the same SVG", async () => {
+    await render(); await click(".cy-workspace-preview__zoom", host);
+    await click(".ant-modal-close");
+    expect(closing.afterClose).toBeTypeOf("function");
+    const firstClose = vi.fn(closing.afterClose!);
+    await click(".cy-workspace-preview__zoom", host);
+    await waitFor(() => !!document.querySelector('[role="dialog"]')?.contains(document.activeElement));
+    await click(".ant-modal-close");
+    const secondClose = closing.afterClose!;
+    const secondDialog = document.querySelector('[role="dialog"]');
+    expect(secondDialog).not.toBeNull();
+    expect(closing.completed).toHaveLength(0);
+    expect(closing.completed).not.toContain(secondClose);
+    const trigger = host.querySelector<HTMLElement>(".cy-workspace-preview__zoom")!;
+    const focus = vi.spyOn(trigger, "focus");
+    // 第二轮退出尚未完成时交付第一轮回调，不能把第二轮提前卸载或恢复焦点。
+    await act(async () => { firstClose(); });
+    expect(firstClose).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[role="dialog"]')).toBe(secondDialog);
+    expect(closing.completed).not.toContain(secondClose);
+    expect(focus).not.toHaveBeenCalled();
+    await waitFor(() => !document.querySelector('[role="dialog"]') && document.activeElement === trigger);
+    expect(closing.completed).toContain(secondClose);
   });
   it("does not steal focus when a closing SVG is replaced by a new preview", async () => {
     await render(); await click(".cy-workspace-preview__zoom", host);
