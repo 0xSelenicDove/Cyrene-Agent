@@ -67,6 +67,7 @@ function createRecordingHost() {
   let todoState: TodoStateBySession = {};
   const earlyTtsQueue = { append: vi.fn(), cancel: vi.fn(), dropPending: vi.fn() } as unknown as EarlyTtsPlaybackQueue;
   const host: AgentRunHost & Record<string, ReturnType<typeof vi.fn>> = {
+    restoreSession: vi.fn(),
     patchMessage: vi.fn(),
     setInteraction: vi.fn(),
     clearInteraction: vi.fn(),
@@ -182,6 +183,67 @@ afterEach(() => {
 });
 
 describe("AgentRunController", () => {
+  it.each(["keep_user", "replace_user"] as const)("restores the authoritative session after a stale %s without checkpointing the rejected run", async (disposition) => {
+    const api = createFakeApi({ success: false, runId: "rejected", error: "TRANSCRIPT_REWIND_STALE" });
+    if (disposition === "keep_user") vi.mocked(api.run).mockRejectedValueOnce(new Error("Error invoking remote method 'agui:run': Error: TRANSCRIPT_REWIND_STALE"));
+    const store = createFakeStore();
+    const authoritative = { id: "session-1", messages: [
+      { id: "user-1", role: "user", content: "original", at: 1 },
+      { id: "old-answer", role: "model", content: "answer", at: 2 },
+      { id: "proactive", role: "model", content: "new proactive", at: 3 },
+    ] } as ChatSession;
+    store.get = vi.fn(async () => authoritative);
+    const { host, earlyTtsQueue } = createRecordingHost();
+    const registries = createRegistries();
+    const { promise } = launch(createInput({ transcriptRewind: {
+      anchorUserTurnId: "user-1", expectedAssistantMessageId: "old-answer", disposition,
+    } }), { api, store, host, registries });
+    await promise;
+    expect(api.run).toHaveBeenCalledWith(expect.objectContaining({ transcriptRewind: {
+      anchorUserTurnId: "user-1", expectedAssistantMessageId: "old-answer", disposition,
+    } }));
+    expect(host.restoreSession).toHaveBeenCalledWith("session-1", authoritative);
+    expect(store.checkpointPresentation).not.toHaveBeenCalled();
+    expect(host.patchMessage).not.toHaveBeenCalled();
+    expect(earlyTtsQueue.cancel).toHaveBeenCalled();
+    expect(registries.activeRuns.current).toEqual({});
+    expect(registries.eventUnsubscribers.current.size).toBe(0);
+    expect(host.setModeBusy).toHaveBeenLastCalledWith("chat", false);
+    expect(host.onRunFinished).toHaveBeenCalledWith({ mode: "chat", sessionId: "session-1", queuePaused: true });
+  });
+
+  it("refreshes the visible conversation through the real SQLite rejection and readback", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-controller-"));
+    const { getConversationDatabase } = await import("../../../../../../main/storage/conversation-database-client");
+    const client = getConversationDatabase(root);
+    const session = await client.call<ChatSession>("chats.createSession", { mode: "chat", purpose: "proactive-chat" });
+    const transcript = new ConversationTranscriptStore(root);
+    const journal = new ConversationJournalService(transcript);
+    await journal.appendUser(session.id, { id: "user:v1:user-1:r1", turnId: "user-1", text: "original", at: 1 });
+    await journal.createRunSink({ conversationId: session.id, runId: "old", assistantTurnId: "old-answer" })
+      .appendAssistant({ message: { role: "assistant", content: "old answer" }, roundId: "reply" });
+    const api = createFakeApi({ success: true, runId: "unused" });
+    vi.mocked(api.run).mockImplementation(async (request) => {
+      // 窗口已经读过快照；把主动消息安排在真正的 runs.admit 之前提交。
+      await journal.createRunSink({ conversationId: session.id, runId: "proactive-intent-1" })
+        .appendAssistant({ message: { role: "assistant", content: "keep proactive" }, roundId: "proactive" });
+      await client.call("runs.admit", session.id, request.assistantTurnId, { ...request, mode: "chat" }, "retry-run");
+      return { success: false, runId: "retry-run", error: "unexpected stale rewind admission" };
+    });
+    const store = createFakeStore();
+    store.get = vi.fn(async () => client.call<ChatSession>("chats.getSession", session.id));
+    const { host } = createRecordingHost();
+    let visible: ChatSession | undefined;
+    host.restoreSession.mockImplementation((_id, restored) => { visible = restored; });
+    const { promise } = launch(createInput({ sessionId: session.id, transcriptRewind: {
+      anchorUserTurnId: "user-1", expectedAssistantMessageId: "old-answer", disposition: "keep_user",
+    } }), { api, store, host, registries: createRegistries() });
+    await promise;
+    expect(visible?.messages.map(message => message.content)).toEqual(["original", "old answer", "keep proactive"]);
+    expect(await client.call("runs.all")).toEqual([]);
+    expect((await transcript.readAuditEntries(session.id)).some(entry => entry.kind === "turn_rewind")).toBe(false);
+    expect(store.checkpointPresentation).not.toHaveBeenCalled();
+  });
   it.each([true, false])("completed duplicate settles without awaiting events or writing checkpoints (message=%s)", async hasMessage => {
     const api = createFakeApi({ success: true, runId: "existing", duplicate: true, status: "completed" });
     const store = createFakeStore();

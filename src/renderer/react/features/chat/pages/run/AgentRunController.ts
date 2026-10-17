@@ -77,6 +77,7 @@ export interface AgentRunInput {
   /** 桌面 edit / regenerate 的轨迹回退锚点（主进程写 turn_rewind；渲染端只传元数据）。 */
   transcriptRewind?: {
     anchorUserTurnId: string;
+    expectedAssistantMessageId: string;
     disposition: "keep_user" | "replace_user";
   };
 }
@@ -92,6 +93,8 @@ export type PlanReviewUpdate =
  * 新增成员前优先考虑合并语义相近的通知。
  */
 export interface AgentRunHost {
+  /** 回退请求过期时恢复权威会话，移除本地编辑结果及未被接受的助手占位。 */
+  restoreSession(sessionId: string, session: ChatSession): void;
   /** 插话边界补用户消息与新的助手消息段；沿用当前 run。 */
   appendMessages?(sessionId: string, messages: ChatMessageItem[]): void;
   onAssistantSegment?(previousId: string, nextId: string): void;
@@ -528,9 +531,19 @@ export class AgentRunController {
       } else this.earlyTtsQueue?.cancel();
     } catch (error) {
       this.earlyTtsQueue?.cancel();
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (!this.runAccepted && this.input.transcriptRewind && errorMessage.includes("TRANSCRIPT_REWIND_STALE")) {
+        // 未被接受的回退不能留下展示检查点；先恢复旧回复及并发到达的消息。
+        try {
+          const session = await store.get(this.input.sessionId);
+          if (session) this.deps.host.restoreSession(this.input.sessionId, session);
+        } catch (refreshError) {
+          console.error("[AgentRunController] stale rewind refresh failed:", refreshError);
+        }
+        return;
+      }
       this.terminalStatus = this.terminalStatus ?? "runtime_error";
       this.completeRunActivity(true);
-      const errorMessage = error instanceof Error ? error.message : String(error);
       // 会话守卫冲突：主进程拒绝了并发 run（典型场景：F5 后立即发消息）。
       // 不走通用错误文案，改为挂起操作卡等用户决定是否终止旧 run 并重开本轮。
       const conflictRunId = parseSessionRunActiveError(errorMessage);
