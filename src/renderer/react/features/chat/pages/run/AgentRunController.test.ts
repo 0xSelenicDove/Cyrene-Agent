@@ -1,5 +1,6 @@
 import { closeConversationDatabases } from "../../../../../../main/storage/conversation-database-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +18,7 @@ import type { TodoStateBySession } from "../session-runtime-state";
 import type { EarlyTtsPlaybackQueue } from "../../tts/early-tts-queue";
 import { ConversationTranscriptStore } from "../../../../../../main/orchestrator/conversation-transcript-store";
 import { ConversationJournalService } from "../../../../../../main/orchestrator/conversation-journal-service";
+import { createPendingQueueFlow } from "../pending-queue-flow";
 
 /**
  * AgentRunController 全流程单测：注入假桥、记录型宿主与真实注册表，
@@ -209,7 +211,46 @@ describe("AgentRunController", () => {
     expect(registries.activeRuns.current).toEqual({});
     expect(registries.eventUnsubscribers.current.size).toBe(0);
     expect(host.setModeBusy).toHaveBeenLastCalledWith("chat", false);
-    expect(host.onRunFinished).toHaveBeenCalledWith({ mode: "chat", sessionId: "session-1", queuePaused: true });
+    expect(host.onRunFinished).toHaveBeenCalledWith({ mode: "chat", sessionId: "session-1", queuePaused: false });
+  });
+
+  it.each([false, true])("continues queued messages after stale recovery unless a claim is unconfirmed (claim=%s)", async hasClaim => {
+    const ack = deferred<AguiRunAck>();
+    const api = createFakeApi({ success: false, runId: "rejected" });
+    vi.mocked(api.run).mockReturnValueOnce(ack.promise);
+    const store = createFakeStore();
+    const authoritative = createInput().session;
+    const queuedUser = { id: "queued-user", role: "user" as const, content: "next", at: 3 };
+    store.get = vi.fn(async () => authoritative);
+    store.pendingEnqueue = vi.fn(async () => ({ ok: true, queue: [{ id: "queued-user", rawContent: "next", visibleContent: "next", enqueuedAt: 3 }] }));
+    store.pendingList = vi.fn(async () => []);
+    store.pendingClaim = vi.fn(async () => ({ ok: true, claimed: true, userMessage: queuedUser, visibleContent: "next", remainingQueue: [], session: authoritative }));
+    const { host } = createRecordingHost();
+    const registries = createRegistries();
+    const startNext = vi.fn(async () => undefined);
+    const flow = createPendingQueueFlow(() => ({
+      getStore: () => store, isSessionBusy: id => !!registries.activeRuns.current[id], hasRenderedMessage: () => false,
+      replaceProjection: vi.fn(), appendMessages: vi.fn(), prepareImageAttachments: vi.fn(), refreshSessions: vi.fn(),
+      startRun: startNext, reportError: vi.fn(),
+    }));
+    host.onRunFinished.mockImplementation(input => flow.handleRunFinished(input));
+    const { promise } = launch(createInput({ claimedPendingMessageId: hasClaim ? "old-claim" : undefined, transcriptRewind: {
+      anchorUserTurnId: "user-1", expectedAssistantMessageId: "old-answer", disposition: "keep_user",
+    } }), { api, store, host, registries });
+    await flush();
+    expect(await flow.enqueue("session-1", "chat", { id: "queued-user", rawContent: "next", visibleContent: "next" })).toBe(true);
+    expect(store.pendingClaim).not.toHaveBeenCalled();
+    ack.resolve({ success: false, runId: "rejected", error: "TRANSCRIPT_REWIND_STALE" });
+    await promise;
+    await flush();
+    if (hasClaim) {
+      expect(startNext).not.toHaveBeenCalled();
+      expect(store.pendingClaim).not.toHaveBeenCalled();
+    } else {
+      expect(startNext).toHaveBeenCalledWith(expect.objectContaining({ userMessageId: "queued-user", claimedPendingMessageId: "queued-user" }));
+      expect(store.pendingClaim).toHaveBeenCalledTimes(1);
+    }
+    expect(store.checkpointPresentation).not.toHaveBeenCalled();
   });
 
   it.each((["keep_user", "replace_user"] as const).flatMap(disposition =>
@@ -242,7 +283,7 @@ describe("AgentRunController", () => {
     expect(host.onRunFinished).toHaveBeenCalledWith({ mode: "chat", sessionId: "session-1", queuePaused: true });
   });
 
-  it("refreshes the visible conversation through the real SQLite rejection and readback", async () => {
+  it.each(["proactive", "compaction"] as const)("refreshes the visible conversation through real SQLite after a %s commit", async (race) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-controller-"));
     try {
       const { getConversationDatabase } = await import("../../../../../../main/storage/conversation-database-client");
@@ -255,9 +296,18 @@ describe("AgentRunController", () => {
         .appendAssistant({ message: { role: "assistant", content: "old answer" }, roundId: "reply" });
       const api = createFakeApi({ success: true, runId: "unused" });
       vi.mocked(api.run).mockImplementation(async (request) => {
-        // 窗口已经读过快照；把主动消息安排在真正的 runs.admit 之前提交。
-        await journal.createRunSink({ conversationId: session.id, runId: "proactive-intent-1" })
-          .appendAssistant({ message: { role: "assistant", content: "keep proactive" }, roundId: "proactive" });
+        // 窗口已经读过快照；把并发消息或压缩安排在真正的 runs.admit 之前提交。
+        if (race === "proactive") {
+          await journal.createRunSink({ conversationId: session.id, runId: "proactive-intent-1" })
+            .appendAssistant({ message: { role: "assistant", content: "keep proactive" }, roundId: "proactive" });
+        } else {
+          const entries = await transcript.readAuditEntries(session.id);
+          await client.call("transcript.compaction", session.id, { id: "compact", kind: "compaction_checkpoint", at: 3, payload: {
+            baseThroughSeq: 0, sourceThroughSeq: entries.at(-1)!.seq,
+            sourceDigest: createHash("sha256").update(JSON.stringify(entries)).digest("hex"),
+            replacement: { role: "system", content: "summary" }, trigger: "manual",
+          } });
+        }
         await client.call("runs.admit", session.id, request.assistantTurnId, { ...request, mode: "chat" }, "retry-run");
         return { success: false, runId: "retry-run", error: "unexpected stale rewind admission" };
       });
@@ -270,7 +320,8 @@ describe("AgentRunController", () => {
         anchorUserTurnId: "user-1", expectedAssistantMessageId: "old-answer", disposition: "keep_user",
       } }), { api, store, host, registries: createRegistries() });
       await promise;
-      expect(visible?.messages.map(message => message.content)).toEqual(["original", "old answer", "keep proactive"]);
+      expect(visible?.messages.map(message => message.content)).toEqual(["original", "old answer", race === "proactive" ? "keep proactive" : ""]);
+      if (race === "compaction") expect(visible?.messages.at(-1)?.compaction).toMatchObject({ trigger: "manual" });
       expect(await client.call("runs.all")).toEqual([]);
       expect((await transcript.readAuditEntries(session.id)).some(entry => entry.kind === "turn_rewind")).toBe(false);
       expect(store.checkpointPresentation).not.toHaveBeenCalled();

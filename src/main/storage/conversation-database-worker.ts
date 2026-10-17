@@ -180,10 +180,6 @@ async function execute(method: string, args: any[]): Promise<unknown> {
           const rewind = facts.transcriptRewind;
           const entries = database.entries(id);
           const projection = reduceTranscriptProjection(database.entries(id, true));
-          if (!projection.state?.nodes.some(node => node.kind === 'user' && node.turnId === rewind.anchorUserTurnId))
-            throw new ConversationStoreError('TRANSCRIPT_REWIND_ANCHOR_NOT_FOUND');
-          if (!isUserTurnRewindableInModelView(entries, rewind.anchorUserTurnId))
-            throw new ConversationStoreError('TRANSCRIPT_REWIND_ACROSS_COMPACTION');
           if (facts.mode === 'chat') {
             const activeUser = projection.state?.nodes.slice().reverse().find(node => node.kind === 'user');
             const [lastUser, lastAssistant] = projection.messages.slice(-2);
@@ -193,6 +189,10 @@ async function execute(method: string, args: any[]): Promise<unknown> {
               || lastUser?.id !== activeUser?.messageId)
               throw new ConversationStoreError('TRANSCRIPT_REWIND_STALE');
           }
+          if (!projection.state?.nodes.some(node => node.kind === 'user' && node.turnId === rewind.anchorUserTurnId))
+            throw new ConversationStoreError('TRANSCRIPT_REWIND_ANCHOR_NOT_FOUND');
+          if (!isUserTurnRewindableInModelView(entries, rewind.anchorUserTurnId))
+            throw new ConversationStoreError('TRANSCRIPT_REWIND_ACROSS_COMPACTION');
           drafts.push({ id: `${runId}:rewind:${rewind.anchorUserTurnId}`, at: Date.now(), kind: 'turn_rewind', runId, turnId: rewind.anchorUserTurnId,
             ...(rewind.disposition === 'replace_user' ? { revision: Math.max(0, ...entries.filter(entry => entry.turnId === rewind.anchorUserTurnId).map(entry => entry.revision ?? 0)) + 1 } : {}),
             payload: { anchorUserTurnId: rewind.anchorUserTurnId, disposition: rewind.disposition, reason: rewind.disposition === 'replace_user' ? 'edit' : 'regenerate',

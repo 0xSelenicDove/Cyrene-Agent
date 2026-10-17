@@ -34,6 +34,27 @@ describe("conversation SQLite transactions", () => {
     expect(await client.call('transcript.audit', id)).toEqual(before);
   });
 
+  it.each((["chat", "work"] as const).flatMap(mode =>
+    (["keep_user", "replace_user"] as const).map(disposition => ({ mode, disposition })),
+  ))("rejects $mode $disposition when compaction commits after the renderer snapshot", async ({ mode, disposition }) => {
+    await client.call('transcript.append', 'c1', user());
+    await client.call('transcript.append', 'c1', { id: 'answer-entry', kind: 'assistant', turnId: 'a1', at: 2, payload: { role: 'assistant', content: 'answer' } });
+    const entries = await client.call<TranscriptEntry[]>('transcript.audit', 'c1');
+    await client.call('transcript.compaction', 'c1', { id: 'compact', kind: 'compaction_checkpoint', at: 3, payload: {
+      baseThroughSeq: 0, sourceThroughSeq: entries.at(-1)!.seq,
+      sourceDigest: createHash('sha256').update(JSON.stringify(entries)).digest('hex'),
+      replacement: { role: 'system', content: 'summary' }, trigger: 'manual',
+    } });
+    const before = await client.call('transcript.audit', 'c1');
+    await expect(client.call('runs.admit', 'c1', 'retry', {
+      mode, currentUser: { turnId: 'u1', text: 'hello', visibleContent: 'hello' },
+      transcriptRewind: { anchorUserTurnId: 'u1', expectedAssistantMessageId: 'a1', disposition },
+    }, 'retry-run')).rejects.toMatchObject({ code: mode === 'chat' ? 'TRANSCRIPT_REWIND_STALE' : 'TRANSCRIPT_REWIND_ACROSS_COMPACTION' });
+    expect(await client.call('transcript.audit', 'c1')).toEqual(before);
+    expect(withConversationDatabase(root, db => db.prepare('SELECT count(*) AS n FROM runs').get()?.n)).toBe(0);
+    expect(withConversationDatabase(root, db => db.prepare('SELECT count(*) AS n FROM conversation_requests').get()?.n)).toBe(0);
+  });
+
   it.each(["keep_user", "replace_user"] as const)("accepts an unchanged %s after a TTS patch and replays its receipt idempotently", async (disposition) => {
     await client.call('transcript.append', 'c1', user());
     await client.call('transcript.append', 'c1', { id: 'answer-entry', kind: 'assistant', turnId: 'a1', at: 2, payload: { role: 'assistant', content: 'answer' } });
