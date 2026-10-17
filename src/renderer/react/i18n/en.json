@@ -414,7 +414,7 @@
     "agentControl": "Cyrene is controlling",
     "actions": { "starting": "Starting", "opening": "Opening page", "switching": "Switching tab", "clicking": "Clicking element", "filling": "Filling text", "pressing": "Pressing key", "scrolling": "Scrolling page", "screenshot": "Capturing page" },
     "emptyTitle": "No page open",
-    "emptyHint": "Enter a complete HTTP or HTTPS URL to start browsing",
+    "emptyHint": "Enter a URL such as example.com to start browsing",
     "errors": {
       "invalidUrl": "Invalid URL. Enter an address such as example.com or https://example.com.",
       "unsupportedProtocol": "This protocol is not supported. Only HTTP and HTTPS pages can be opened.",

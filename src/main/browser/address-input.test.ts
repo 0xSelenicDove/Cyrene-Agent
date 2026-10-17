@@ -9,7 +9,11 @@ describe("地址栏输入补全协议", () => {
     ["github.com:443", "https://github.com:443"],
     ["例子.中国", "https://例子.中国"],
     ["xn--fsqu00a.xn--fiqs8s", "https://xn--fsqu00a.xn--fiqs8s"],
+    ["foo_bar.example.com", "https://foo_bar.example.com"],
+    ["nas_01.home", "https://nas_01.home"],
     ["8.8.8.8", "https://8.8.8.8"],
+    ["[2001:4860:4860::8888]", "https://[2001:4860:4860::8888]"],
+    ["[::ffff:8.8.8.8]", "https://[::ffff:8.8.8.8]"],
   ])("公网域名 / IP 补 https：%s", (input, expected) => {
     expect(normalizeAddressInput(input)).toBe(expected);
     expect(new URL(expected).protocol).toBe("https:");
@@ -18,6 +22,7 @@ describe("地址栏输入补全协议", () => {
   it.each([
     ["localhost", "http://localhost"],
     ["localhost:3000", "http://localhost:3000"],
+    ["localhost:0", "http://localhost:0"],
     ["LOCALHOST:5173/settings#general", "http://LOCALHOST:5173/settings#general"],
     ["app.localhost:8080", "http://app.localhost:8080"],
     ["127.0.0.1:8080", "http://127.0.0.1:8080"],
@@ -25,9 +30,40 @@ describe("地址栏输入补全协议", () => {
     ["10.0.0.2:9000/api", "http://10.0.0.2:9000/api"],
     ["172.20.0.5", "http://172.20.0.5"],
     ["[::1]:3000", "http://[::1]:3000"],
+    ["[fe80::1]", "http://[fe80::1]"],
+    ["[fd00::1]:8080", "http://[fd00::1]:8080"],
+    ["[::ffff:192.168.0.1]", "http://[::ffff:192.168.0.1]"],
   ])("本机 / 局域网地址补 http：%s", (input, expected) => {
     expect(normalizeAddressInput(input)).toBe(expected);
     expect(new URL(expected).protocol).toBe("http:");
+  });
+
+  it.each([
+    // 解析器把补零段按八进制读：原文像内网的实为公网，原文像公网的实为本机
+    ["010.010.010.010", "https://010.010.010.010", "8.8.8.8"],
+    ["0177.0.0.1", "http://0177.0.0.1", "127.0.0.1"],
+  ])("按解析器规范化后的 IPv4 选协议：%s", (input, expected, canonicalHost) => {
+    expect(normalizeAddressInput(input)).toBe(expected);
+    expect(new URL(expected).hostname).toBe(canonicalHost);
+  });
+
+  it.each([
+    ["例子。中国", "https://例子.中国"],
+    ["www。google。com", "https://www.google.com"],
+    ["www．google．com", "https://www.google.com"],
+    ["localhost：3000", "http://localhost:3000"],
+    ["example.com/路径。不变", "https://example.com/路径。不变"],
+  ])("主机部分的全角句点 / 冒号归一化，路径保持原样：%s", (input, expected) => {
+    expect(normalizeAddressInput(input)).toBe(expected);
+    expect(() => new URL(expected)).not.toThrow();
+  });
+
+  it.each([
+    ["//example.com/path", "https://example.com/path"],
+    ["localhost.", "http://localhost."],
+    ["127.0.0.1.", "http://127.0.0.1."],
+  ])("协议相对地址与尾部点：%s", (input, expected) => {
+    expect(normalizeAddressInput(input)).toBe(expected);
   });
 
   it.each([
@@ -55,12 +91,16 @@ describe("地址栏输入补全协议", () => {
     "昔涟",
     "intranet",
     "1.5",
+    "1.2.3",
+    "0x7f.0.0.1",
     "user@example.com",
     "localhost:99999",
     "localhost:abc",
     "-bad-.com",
     "999.1.1.1",
-  ])("认不出的输入原样返回（不猜测、不拼搜索）：%j", (input) => {
+    "[foo]:80",
+    "[fe80::1%25eth0]",
+  ])("认不出或解析器不接受的输入原样返回（不猜测、不拼搜索）：%j", (input) => {
     expect(normalizeAddressInput(input)).toBe(input);
   });
 });

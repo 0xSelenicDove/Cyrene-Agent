@@ -430,7 +430,7 @@
     "agentControl": "Cyrene が操作中",
     "actions": { "starting": "開始中", "opening": "ページを開いています", "switching": "タブを切り替えています", "clicking": "要素をクリックしています", "filling": "テキストを入力しています", "pressing": "キーを押しています", "scrolling": "ページをスクロールしています", "screenshot": "画面を撮影しています" },
     "emptyTitle": "ページが開かれていません",
-    "emptyHint": "完全な HTTP または HTTPS URL を入力して閲覧を開始",
+    "emptyHint": "example.com のような URL を入力して閲覧を開始",
     "errors": {
       "invalidUrl": "URL が無効です。example.com や https://example.com のようなアドレスを入力してください。",
       "unsupportedProtocol": "このプロトコルには対応していません。HTTP と HTTPS のみ開けます。",
