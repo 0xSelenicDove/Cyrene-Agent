@@ -3,7 +3,10 @@
  *
  * 只用于地址栏（BROWSER_PANEL_NAVIGATE）。Agent 浏览器工具仍要求完整 URL，不经过这里。
  * 补全后仍交给控制器的 http(s) 校验（http-url.ts），因此 `file:`、`javascript:` 等协议照旧被拒绝；
- * 认不出的输入（普通文字、无端口的单段主机名、带用户信息的串、UNC 路径）原样返回，由控制器给出错误码。
+ * 认不出的输入（普通文字、单段主机名、带用户信息的串、UNC 路径）原样返回，由控制器给出错误码。
+ *
+ * 单段主机名一律不补全（`localhost` 除外）：`nas:8080` 与 `ssh:22`、`redis:6379` 这类「协议:端口」
+ * 形态完全相同，任何协议名单都不完整，宁可提示「网址无效」让用户写全 `http://nas:8080`。
  *
  * 主机分类一律基于 WHATWG URL 解析后的规范主机名，而不是用户原文：
  * 八进制 / 补零 IPv4（`010.010.010.010` 实为 8.8.8.8）、IDN、全角字母都先由解析器规范化，
@@ -17,20 +20,12 @@ const DOTTED_QUAD = /^\d+(?:\.\d+){3}\.?$/;
 const CANONICAL_IPV4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
 const DOMAIN_LABEL = /^[a-z\d_](?:[a-z\d_-]*[a-z\d_])?$/;
 const TLD = /^(?:[a-z]{2,}|xn--[a-z\d-]+)$/;
-const EXPLICIT_PORT = /:\d+$/;
 /**
  * 只在本机 / 局域网解析的保留后缀（RFC 6761 / 6762 / 8375 及常见路由器默认域）：
  * 这类设备基本只有 http，补 https 会把「网址无效」变成更难懂的「页面加载失败」。
+ * 必须前面还有一段名字（`printer.local`）；单独的 `local`、`test` 只是一个词，不补全。
  */
 const LOCAL_SUFFIXES = ["localhost", "local", "test", "invalid", "internal", "home.arpa", "lan", "home"];
-/**
- * 单段主机名 + 端口按内网机器处理（`nas:8080`），但这些名字本身是常见协议名，
- * `javascript:80` 之类不当成主机，原样交给控制器拒绝。
- */
-const SCHEME_LIKE_HOSTS = new Set([
-  "about", "blob", "chrome", "data", "devtools", "file", "filesystem", "ftp", "http", "https",
-  "intent", "javascript", "mailto", "sms", "tel", "view-source", "ws", "wss",
-]);
 
 export function normalizeAddressInput(input: string): string {
   let trimmed = input.trim();
@@ -87,13 +82,10 @@ function classifyHost(hostname: string, rawAuthority: string): HostKind {
     if (!DOTTED_QUAD.test(rawAuthority.replace(/:\d*$/, ""))) return null;
     return isLocalIpv4(ipv4) ? "local" : "public";
   }
+  if (host === "localhost") return "local";
   const labels = host.split(".");
-  if (!labels.every((label) => DOMAIN_LABEL.test(label))) return null;
-  if (LOCAL_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return "local";
-  if (labels.length === 1) {
-    // 单段主机名（`nas`、`my-server`）只有带端口时才当内网地址，否则可能只是一个词
-    return EXPLICIT_PORT.test(rawAuthority) && !SCHEME_LIKE_HOSTS.has(host) ? "local" : null;
-  }
+  if (labels.length < 2 || !labels.every((label) => DOMAIN_LABEL.test(label))) return null;
+  if (LOCAL_SUFFIXES.some((suffix) => host.endsWith(`.${suffix}`))) return "local";
   return TLD.test(labels[labels.length - 1]) ? "public" : null;
 }
 

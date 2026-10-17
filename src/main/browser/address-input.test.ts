@@ -53,13 +53,6 @@ const CGNAT_HTTP: Rewrite[] = [
   ["[::ffff:100.64.0.1]", "http://[::ffff:100.64.0.1]"],
 ];
 
-const SINGLE_LABEL_WITH_PORT: Rewrite[] = [
-  ["nas:8080", "http://nas:8080"],
-  ["router:80", "http://router:80"],
-  ["my-server:3000", "http://my-server:3000"],
-  ["my_server:3000/api", "http://my_server:3000/api"],
-];
-
 const FULLWIDTH: Rewrite[] = [
   ["例子。中国", "https://例子.中国"],
   ["www。google。com", "https://www.google.com"],
@@ -122,11 +115,26 @@ const UNCHANGED: Unchanged[] = [
   ["localhost:65536", "invalid_url"],
   ["localhost:99999", "invalid_url"],
   ["nas:99999", "invalid_url"],
-  // 协议名当作单段主机名时不补全
+  // 单段主机名 + 端口与「协议:端口」形态相同，一律不补全，提示「网址无效」
+  ["nas:8080", "invalid_url"],
+  ["router:80", "invalid_url"],
+  ["my-server:3000", "invalid_url"],
+  ["my_server:3000/api", "invalid_url"],
+  ["ssh:22", "invalid_url"],
+  ["git:9418", "invalid_url"],
+  ["redis:6379", "invalid_url"],
   ["javascript:80", "invalid_url"],
   ["about:80", "invalid_url"],
   ["mailto:80", "invalid_url"],
   ["file:8080", "invalid_url"],
+  // 保留后缀单独出现只是一个词，不补全
+  ["local", "invalid_url"],
+  ["test", "invalid_url"],
+  ["home", "invalid_url"],
+  ["internal", "invalid_url"],
+  ["lan", "invalid_url"],
+  ["invalid", "invalid_url"],
+  ["test:3000", "invalid_url"],
   // UNC 共享路径与以斜杠开头的路径不是网址
   ["\\\\example.com\\share", "invalid_url"],
   ["\\\\10.0.0.5\\share", "invalid_url"],
@@ -148,10 +156,6 @@ describe("地址栏输入补全协议", () => {
   });
 
   it.each(CGNAT_HTTP)("运营商级 NAT（Tailscale）100.64.0.0/10 补 http：%s", (input, expected) => {
-    expect(normalizeAddressInput(input)).toBe(expected);
-  });
-
-  it.each(SINGLE_LABEL_WITH_PORT)("单段主机名带端口按内网机器补 http：%s", (input, expected) => {
     expect(normalizeAddressInput(input)).toBe(expected);
   });
 
@@ -196,7 +200,7 @@ describe("地址栏输入补全协议", () => {
 describe("补全结果与控制器校验一致", () => {
   const rewrites = [
     ...PUBLIC_HTTPS, ...LOCAL_HTTP, ...RESERVED_LOCAL_SUFFIX, ...CGNAT_HTTP,
-    ...SINGLE_LABEL_WITH_PORT, ...FULLWIDTH, ...MISC_SHAPES, ...OCTAL_IPV4,
+    ...FULLWIDTH, ...MISC_SHAPES, ...OCTAL_IPV4,
   ];
 
   it.each(rewrites)("改写后的地址可被控制器导航：%s", (input) => {
