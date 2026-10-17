@@ -2,21 +2,35 @@
  * 地址栏输入补全：用户手输 `google.com`、`localhost:3000` 这类不带协议的地址时补上协议。
  *
  * 只用于地址栏（BROWSER_PANEL_NAVIGATE）。Agent 浏览器工具仍要求完整 URL，不经过这里。
- * 补全后仍交给控制器的 http(s) 校验，因此 `file:`、`javascript:` 等协议照旧被拒绝；
- * 认不出的输入（普通文字、单段主机名、带用户信息的串）原样返回，由控制器给出原有错误码。
+ * 补全后仍交给控制器的 http(s) 校验（http-url.ts），因此 `file:`、`javascript:` 等协议照旧被拒绝；
+ * 认不出的输入（普通文字、无端口的单段主机名、带用户信息的串、UNC 路径）原样返回，由控制器给出错误码。
  *
  * 主机分类一律基于 WHATWG URL 解析后的规范主机名，而不是用户原文：
  * 八进制 / 补零 IPv4（`010.010.010.010` 实为 8.8.8.8）、IDN、全角字母都先由解析器规范化，
  * 再判断走 http 还是 https，避免「原文看着像内网、实际访问公网」的错配。
  */
 
-const SCHEME_PREFIX = /^([a-z][a-z\d+.-]*):/i;
-const HOST_PORT_REST = /^\d{1,5}(?:[/?#\\]|$)/;
+import { hasExplicitScheme } from "./http-url";
+
 /** 用户原文是四段纯数字（可带补零 / 尾点）才当 IP 补全，`1.5`、`0x7f.0.0.1` 这类不当地址。 */
 const DOTTED_QUAD = /^\d+(?:\.\d+){3}\.?$/;
 const CANONICAL_IPV4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
 const DOMAIN_LABEL = /^[a-z\d_](?:[a-z\d_-]*[a-z\d_])?$/;
 const TLD = /^(?:[a-z]{2,}|xn--[a-z\d-]+)$/;
+const EXPLICIT_PORT = /:\d+$/;
+/**
+ * 只在本机 / 局域网解析的保留后缀（RFC 6761 / 6762 / 8375 及常见路由器默认域）：
+ * 这类设备基本只有 http，补 https 会把「网址无效」变成更难懂的「页面加载失败」。
+ */
+const LOCAL_SUFFIXES = ["localhost", "local", "test", "invalid", "internal", "home.arpa", "lan", "home"];
+/**
+ * 单段主机名 + 端口按内网机器处理（`nas:8080`），但这些名字本身是常见协议名，
+ * `javascript:80` 之类不当成主机，原样交给控制器拒绝。
+ */
+const SCHEME_LIKE_HOSTS = new Set([
+  "about", "blob", "chrome", "data", "devtools", "file", "filesystem", "ftp", "http", "https",
+  "intent", "javascript", "mailto", "sms", "tel", "view-source", "ws", "wss",
+]);
 
 export function normalizeAddressInput(input: string): string {
   let trimmed = input.trim();
@@ -24,13 +38,13 @@ export function normalizeAddressInput(input: string): string {
   // 协议相对地址 `//example.com/path`：按省略协议处理
   if (trimmed.startsWith("//")) trimmed = trimmed.slice(2);
   const candidate = normalizeAuthorityPunctuation(trimmed);
-  // 只有主机部分出现空白才视为普通文字（如 `cyrene agent`）；
-  // 路径 / 查询里的空格（`example.com/search?q=a b`）由解析器按 URL 规范百分号编码
-  if (/\s/.test(readAuthority(candidate))) return input;
+  const authority = readAuthority(candidate);
+  // 主机部分为空（`\\server\share` 这类 UNC 路径、`/path`）不是网址；
+  // 只有主机部分出现空白才视为普通文字（如 `cyrene agent`），路径 / 查询里的空格由解析器编码
+  if (!authority || /\s/.test(authority)) return input;
 
   // 已带协议（含 http/https 以外的协议）一律不动；`localhost:3000` 这类「主机:端口」不算协议
-  const scheme = SCHEME_PREFIX.exec(candidate);
-  if (scheme && !HOST_PORT_REST.test(candidate.slice(scheme[0].length))) return input;
+  if (hasExplicitScheme(candidate)) return input;
 
   let url: URL;
   try {
@@ -40,7 +54,7 @@ export function normalizeAddressInput(input: string): string {
   }
   if (url.username || url.password) return input;
 
-  const kind = classifyHost(url.hostname, candidate);
+  const kind = classifyHost(url.hostname, authority);
   if (kind === "local") return `http://${candidate}`;
   if (kind === "public") return `https://${candidate}`;
   return input;
@@ -64,18 +78,22 @@ function readAuthority(value: string): string {
 
 type HostKind = "local" | "public" | null;
 
-function classifyHost(hostname: string, candidate: string): HostKind {
+/** hostname 是解析器给出的规范主机名，rawAuthority 是用户原文（已做全角归一化）的主机部分。 */
+function classifyHost(hostname: string, rawAuthority: string): HostKind {
   if (hostname.startsWith("[")) return classifyIpv6(hostname.slice(1, -1));
   const host = hostname.replace(/\.$/, "");
   const ipv4 = readCanonicalIpv4(host);
   if (ipv4) {
-    const rawHost = readAuthority(candidate).replace(/:\d*$/, "");
-    if (!DOTTED_QUAD.test(rawHost)) return null;
+    if (!DOTTED_QUAD.test(rawAuthority.replace(/:\d*$/, ""))) return null;
     return isLocalIpv4(ipv4) ? "local" : "public";
   }
-  if (host === "localhost" || host.endsWith(".localhost")) return "local";
   const labels = host.split(".");
-  if (labels.length < 2 || !labels.every((label) => DOMAIN_LABEL.test(label))) return null;
+  if (!labels.every((label) => DOMAIN_LABEL.test(label))) return null;
+  if (LOCAL_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) return "local";
+  if (labels.length === 1) {
+    // 单段主机名（`nas`、`my-server`）只有带端口时才当内网地址，否则可能只是一个词
+    return EXPLICIT_PORT.test(rawAuthority) && !SCHEME_LIKE_HOSTS.has(host) ? "local" : null;
+  }
   return TLD.test(labels[labels.length - 1]) ? "public" : null;
 }
 
@@ -84,12 +102,14 @@ function readCanonicalIpv4(host: string): number[] | null {
   return match ? match.slice(1).map(Number) : null;
 }
 
-/** 本机与局域网地址默认走 http：本地开发服务器通常没有证书。 */
+/** 本机与局域网地址默认走 http：本地开发服务器、NAS、路由器通常没有证书。 */
 function isLocalIpv4([a, b]: number[]): boolean {
   return a === 127 || a === 10 || a === 0
     || (a === 192 && b === 168)
     || (a === 172 && b >= 16 && b <= 31)
-    || (a === 169 && b === 254);
+    || (a === 169 && b === 254)
+    // RFC 6598 运营商级 NAT 段，Tailscale 等组网工具也用它
+    || (a === 100 && b >= 64 && b <= 127);
 }
 
 /** 解析器已把 IPv6 规范化（小写、压缩、内嵌 IPv4 转十六进制），这里只需展开成 8 组。 */
