@@ -212,6 +212,36 @@ describe("AgentRunController", () => {
     expect(host.onRunFinished).toHaveBeenCalledWith({ mode: "chat", sessionId: "session-1", queuePaused: true });
   });
 
+  it.each((["keep_user", "replace_user"] as const).flatMap(disposition =>
+    (["missing", "read_error", "restore_error"] as const).map(failure => ({ disposition, failure })),
+  ))("settles a rejected stale $disposition visibly after $failure", async ({ disposition, failure }) => {
+    const api = createFakeApi({ success: false, runId: "rejected", error: "TRANSCRIPT_REWIND_STALE" });
+    const store = createFakeStore();
+    store.get = failure === "read_error"
+      ? vi.fn().mockRejectedValue(new Error("read unavailable"))
+      : vi.fn().mockResolvedValue(failure === "missing" ? null : createInput().session);
+    const { host, earlyTtsQueue } = createRecordingHost();
+    if (failure === "restore_error") host.restoreSession.mockImplementation(() => { throw new Error("restore failed"); });
+    const registries = createRegistries();
+    const { promise } = launch(createInput({ transcriptRewind: {
+      anchorUserTurnId: "user-1", expectedAssistantMessageId: "old-answer", disposition,
+    } }), { api, store, host, registries });
+    await promise;
+    expect(host.patchMessage).toHaveBeenCalledWith("session-1", "assistant-1", expect.objectContaining({
+      content: expect.stringMatching(/刷新|refresh|更新/),
+      loading: false, waitingForFirstEvent: false, streaming: false, reasoningStreaming: false, responseStarted: true,
+    }));
+    expect(store.checkpointPresentation).not.toHaveBeenCalled();
+    expect(store.upsert).not.toHaveBeenCalled();
+    expect(api.reportRunPersisted).not.toHaveBeenCalled();
+    expect(earlyTtsQueue.cancel).toHaveBeenCalled();
+    expect(registries.activeRuns.current).toEqual({});
+    expect(registries.checkpointTriggers.current).toEqual({});
+    expect(registries.eventUnsubscribers.current.size).toBe(0);
+    expect(host.setModeBusy).toHaveBeenLastCalledWith("chat", false);
+    expect(host.onRunFinished).toHaveBeenCalledWith({ mode: "chat", sessionId: "session-1", queuePaused: true });
+  });
+
   it("refreshes the visible conversation through the real SQLite rejection and readback", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rewind-controller-"));
     const { getConversationDatabase } = await import("../../../../../../main/storage/conversation-database-client");

@@ -95,6 +95,7 @@
     "errorModelRequestFailed": "Model request failed",
     "errorModelRequestStartFailed": "Couldn't start the model request",
     "lastTurnChanged": "The conversation has changed and has been refreshed. Please select the message to edit or regenerate again.",
+    "lastTurnRefreshFailed": "The conversation has changed, but refreshing failed. This turn wasn't executed. Refresh the window or reopen the conversation before trying again.",
     "sessionRunActiveNotice": "A task is already running in this session (possibly from before a refresh), so this turn wasn't executed.",
     "errorModelRequestFailedWith": "Model request failed: {{message}}",
     "errorChatStoreUnavailable": "The chat session service isn't ready yet",

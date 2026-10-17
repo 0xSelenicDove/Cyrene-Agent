@@ -536,10 +536,22 @@ export class AgentRunController {
         // 未被接受的回退不能留下展示检查点；先恢复旧回复及并发到达的消息。
         try {
           const session = await store.get(this.input.sessionId);
-          if (session) this.deps.host.restoreSession(this.input.sessionId, session);
+          if (session) {
+            this.deps.host.restoreSession(this.input.sessionId, session);
+            return;
+          }
         } catch (refreshError) {
           console.error("[AgentRunController] stale rewind refresh failed:", refreshError);
         }
+        // 回读失败也要结束占位；错误仅展示，不能为未准入的运行写检查点。
+        this.deps.host.patchMessage(this.input.sessionId, this.input.assistantId, {
+          content: t("chatPage.lastTurnRefreshFailed"),
+          loading: false,
+          waitingForFirstEvent: false,
+          streaming: false,
+          reasoningStreaming: false,
+          responseStarted: true,
+        });
         return;
       }
       this.terminalStatus = this.terminalStatus ?? "runtime_error";
