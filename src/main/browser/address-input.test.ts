@@ -59,6 +59,15 @@ describe("地址栏输入补全协议", () => {
   });
 
   it.each([
+    ["example.com/search?q=cyrene agent", "https://example.com/search?q=cyrene agent", "https://example.com/search?q=cyrene%20agent"],
+    ["github.com/foo bar#a b", "https://github.com/foo bar#a b", "https://github.com/foo%20bar#a%20b"],
+    ["localhost:3000/a b", "http://localhost:3000/a b", "http://localhost:3000/a%20b"],
+  ])("路径 / 查询 / 片段里的空格不影响补全，由解析器编码：%s", (input, expected, href) => {
+    expect(normalizeAddressInput(input)).toBe(expected);
+    expect(new URL(expected).href).toBe(href);
+  });
+
+  it.each([
     ["//example.com/path", "https://example.com/path"],
     ["localhost.", "http://localhost."],
     ["127.0.0.1.", "http://127.0.0.1."],
@@ -88,6 +97,8 @@ describe("地址栏输入补全协议", () => {
     "",
     "   ",
     "cyrene agent",
+    "google.com is great",
+    "example.com hello/world",
     "昔涟",
     "intranet",
     "1.5",

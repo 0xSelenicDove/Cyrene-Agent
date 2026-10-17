@@ -20,10 +20,13 @@ const TLD = /^(?:[a-z]{2,}|xn--[a-z\d-]+)$/;
 
 export function normalizeAddressInput(input: string): string {
   let trimmed = input.trim();
-  if (!trimmed || /\s/.test(trimmed)) return input;
+  if (!trimmed) return input;
   // 协议相对地址 `//example.com/path`：按省略协议处理
   if (trimmed.startsWith("//")) trimmed = trimmed.slice(2);
   const candidate = normalizeAuthorityPunctuation(trimmed);
+  // 只有主机部分出现空白才视为普通文字（如 `cyrene agent`）；
+  // 路径 / 查询里的空格（`example.com/search?q=a b`）由解析器按 URL 规范百分号编码
+  if (/\s/.test(readAuthority(candidate))) return input;
 
   // 已带协议（含 http/https 以外的协议）一律不动；`localhost:3000` 这类「主机:端口」不算协议
   const scheme = SCHEME_PREFIX.exec(candidate);
@@ -45,10 +48,13 @@ export function normalizeAddressInput(input: string): string {
 
 /** 中文输入法下常见的全角句点 / 冒号，只在主机部分归一化，路径与查询保持原样。 */
 function normalizeAuthorityPunctuation(value: string): string {
+  const authority = readAuthority(value);
+  return authority.replace(/[。．｡]/g, ".").replace(/：/g, ":") + value.slice(authority.length);
+}
+
+function readAuthority(value: string): string {
   const end = value.search(/[/?#]/);
-  const authority = end === -1 ? value : value.slice(0, end);
-  const rest = end === -1 ? "" : value.slice(end);
-  return authority.replace(/[。．｡]/g, ".").replace(/：/g, ":") + rest;
+  return end === -1 ? value : value.slice(0, end);
 }
 
 type HostKind = "local" | "public" | null;
@@ -58,7 +64,7 @@ function classifyHost(hostname: string, candidate: string): HostKind {
   const host = hostname.replace(/\.$/, "");
   const ipv4 = readCanonicalIpv4(host);
   if (ipv4) {
-    const rawHost = candidate.split(/[/?#]/, 1)[0].replace(/:\d*$/, "");
+    const rawHost = readAuthority(candidate).replace(/:\d*$/, "");
     if (!DOTTED_QUAD.test(rawHost)) return null;
     return isLocalIpv4(ipv4) ? "local" : "public";
   }
