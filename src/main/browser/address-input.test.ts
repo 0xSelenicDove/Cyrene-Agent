@@ -53,6 +53,9 @@ describe("地址栏输入补全协议", () => {
     ["www．google．com", "https://www.google.com"],
     ["localhost：3000", "http://localhost:3000"],
     ["example.com/路径。不变", "https://example.com/路径。不变"],
+    ["１２７。０。０。１", "http://127.0.0.1"],
+    ["１９２．１６８．１．１：８０８０", "http://192.168.1.1:8080"],
+    ["example.com/页码１２", "https://example.com/页码１２"],
   ])("主机部分的全角句点 / 冒号归一化，路径保持原样：%s", (input, expected) => {
     expect(normalizeAddressInput(input)).toBe(expected);
     expect(() => new URL(expected)).not.toThrow();
@@ -63,6 +66,15 @@ describe("地址栏输入补全协议", () => {
     ["github.com/foo bar#a b", "https://github.com/foo bar#a b", "https://github.com/foo%20bar#a%20b"],
     ["localhost:3000/a b", "http://localhost:3000/a b", "http://localhost:3000/a%20b"],
   ])("路径 / 查询 / 片段里的空格不影响补全，由解析器编码：%s", (input, expected, href) => {
+    expect(normalizeAddressInput(input)).toBe(expected);
+    expect(new URL(expected).href).toBe(href);
+  });
+
+  it.each([
+    ["127.0.0.1\\status", "http://127.0.0.1\\status", "http://127.0.0.1/status"],
+    ["localhost:3000\\a", "http://localhost:3000\\a", "http://localhost:3000/a"],
+    ["example.com\\a。b", "https://example.com\\a。b", "https://example.com/a%E3%80%82b"],
+  ])("反斜杠按解析器规则视为路径起点：%s", (input, expected, href) => {
     expect(normalizeAddressInput(input)).toBe(expected);
     expect(new URL(expected).href).toBe(href);
   });

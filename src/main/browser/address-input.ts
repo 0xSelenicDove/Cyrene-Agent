@@ -11,7 +11,7 @@
  */
 
 const SCHEME_PREFIX = /^([a-z][a-z\d+.-]*):/i;
-const HOST_PORT_REST = /^\d{1,5}(?:[/?#]|$)/;
+const HOST_PORT_REST = /^\d{1,5}(?:[/?#\\]|$)/;
 /** 用户原文是四段纯数字（可带补零 / 尾点）才当 IP 补全，`1.5`、`0x7f.0.0.1` 这类不当地址。 */
 const DOTTED_QUAD = /^\d+(?:\.\d+){3}\.?$/;
 const CANONICAL_IPV4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/;
@@ -46,14 +46,19 @@ export function normalizeAddressInput(input: string): string {
   return input;
 }
 
-/** 中文输入法下常见的全角句点 / 冒号，只在主机部分归一化，路径与查询保持原样。 */
+/** 中文输入法下常见的全角句点 / 冒号 / 数字，只在主机部分归一化，路径与查询保持原样。 */
 function normalizeAuthorityPunctuation(value: string): string {
   const authority = readAuthority(value);
-  return authority.replace(/[。．｡]/g, ".").replace(/：/g, ":") + value.slice(authority.length);
+  return authority
+    .replace(/[。．｡]/g, ".")
+    .replace(/：/g, ":")
+    .replace(/[０-９]/g, (digit) => String.fromCharCode(digit.charCodeAt(0) - 0xfee0))
+    + value.slice(authority.length);
 }
 
+/** 主机部分到第一个 `/ ? # \` 为止；WHATWG URL 对 http(s) 把 `\` 当作 `/`。 */
 function readAuthority(value: string): string {
-  const end = value.search(/[/?#]/);
+  const end = value.search(/[/?#\\]/);
   return end === -1 ? value : value.slice(0, end);
 }
 
