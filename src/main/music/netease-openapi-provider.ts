@@ -20,7 +20,7 @@ import {
 } from "./openapi-result-normalizer";
 
 export type PlaybackDispatcher = (
-  resource: { kind: "song"; playUrl: string; track: MusicTrack } | { kind: "playlist"; playUrl: string; tracks: MusicTrack[] },
+  resource: { kind: "song"; playUrl: string; track: MusicTrack } | { kind: "playlist"; playUrl: string; tracks: MusicTrack[]; selectedTrack: MusicTrack },
 ) => Promise<PlaybackDispatchResult>;
 
 const PLAYLIST_PAGE_SIZE = 30;
@@ -75,7 +75,8 @@ export class NeteaseOpenapiProvider implements MusicProvider {
     for (const track of tracks) {
       const detail = await this.client.getSongDetail(track.id);
       if (detail.playUrl) {
-        return this.dispatch({ kind: "playlist", playUrl: detail.playUrl, tracks });
+        // 保留歌单顺序，同时显式绑定实际解析出 URL 的曲目，避免元数据和缓存身份错配。
+        return this.dispatch({ kind: "playlist", playUrl: detail.playUrl, tracks, selectedTrack: track });
       }
     }
     throw new MusicInputError("E_PLAYLIST_NOT_PLAYABLE", `E_PLAYLIST_NOT_PLAYABLE: ${playlistId}`);
