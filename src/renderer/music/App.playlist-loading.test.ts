@@ -79,6 +79,17 @@ describe("music playlist loading", () => {
     expect(capture.props!.playlistLoadError).toBeUndefined();
   });
 
+  it("replaces a failed playlist notice when explicitly playing an unavailable song", async () => {
+    const api = await mount();
+    api.mockResolvedValue({ ok: false, errorCode: "E_PLAYLIST_LOAD_INCOMPLETE" });
+    await act(async () => { capture.props!.actions.loadPlaylist(playlist("failed")); });
+    expect(capture.props!.playlistLoadError).toBeDefined();
+    const song = { ...capture.props!.state.queue[0], visible: false };
+    await act(async () => { capture.props!.actions.playTrack(song); });
+    expect(capture.props!.playlistLoadError).toBeUndefined();
+    expect(capture.props!.state.error).toContain("暂时无法播放");
+  });
+
   it.each(["success", "failure"])("ignores stale %s after a newer playlist has loaded", async (kind) => {
     const api = await mount();
     const old = deferred<{ ok: boolean; data?: unknown; errorCode?: string }>();

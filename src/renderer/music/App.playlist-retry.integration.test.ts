@@ -13,7 +13,7 @@ afterEach(async () => {
   vi.useRealTimers(); vi.restoreAllMocks();
 });
 
-it("retries the failed playlist through the real player after a playback event, without replaying the old song", async () => {
+async function mountFailedPlaylist() {
   vi.useFakeTimers(); localStorage.clear();
   let playback!: (state: unknown) => void;
   const old = { id: "old-song", name: "旧歌", artists: [] };
@@ -41,6 +41,11 @@ it("retries the failed playlist through the real player after a playback event, 
   await act(async () => { chip!.click(); });
   expect(document.querySelector('[role="alert"]')?.textContent).toContain("歌单加载失败");
   expect(document.querySelector(".playlist-chip.is-active")?.textContent).toBe("旧歌单");
+  return { playback, getPlaylistDetail, playSessionTrack };
+}
+
+it("retries the failed playlist through the real player after a playback event, without replaying the old song", async () => {
+  const { playback, getPlaylistDetail, playSessionTrack } = await mountFailedPlaylist();
   await act(async () => { playback({ paused: false, position: 5, duration: 180, error: undefined }); });
   expect(document.querySelector('[role="alert"]')?.textContent).toContain("歌单加载失败");
   getPlaylistDetail.mockResolvedValue({ ok: true, data: { tracks: Array.from({ length: 61 }, (_, i) => ({ id: `new-${i}`, name: `新歌${i}`, artists: [] })) } });
@@ -50,4 +55,21 @@ it("retries the failed playlist through the real player after a playback event, 
   expect(document.querySelector('[role="alert"]')).toBeNull();
   expect(document.querySelector(".playlist-chip.is-active")?.textContent).toBe("新歌单");
   expect(document.querySelector(".panel-count")?.textContent).toBe("61");
+});
+
+
+it("shows the latest explicit playback failure and retries that song after a playlist load failed", async () => {
+  const { getPlaylistDetail, playSessionTrack } = await mountFailedPlaylist();
+  playSessionTrack.mockResolvedValue({ ok: false, errorCode: "E_PLAYBACK_FAILED" });
+  const song = document.querySelector<HTMLButtonElement>('button[title="播放"]');
+  expect(song).toBeTruthy();
+  await act(async () => { song!.click(); });
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain("播放失败：E_PLAYBACK_FAILED");
+  expect(document.querySelector('[role="alert"]')?.textContent).not.toContain("歌单加载失败");
+  playSessionTrack.mockResolvedValue({ ok: true });
+  await act(async () => { (document.querySelector(".mp-error-retry") as HTMLButtonElement).click(); });
+  expect(playSessionTrack).toHaveBeenCalledTimes(2);
+  expect(playSessionTrack.mock.calls[1][0].queue[0].encryptedId).toBe("old-song");
+  expect(getPlaylistDetail.mock.calls.filter(([id]) => id === "failed")).toHaveLength(1);
+  expect(document.querySelector('[role="alert"]')).toBeNull();
 });

@@ -600,6 +600,8 @@ export function App() {
   // ── 播放指定歌曲（本地 queue 管理 + IPC 派发） ──────────────
   const playTrack = useCallback(
     (track: Track) => {
+      // 新的主动播放操作优先于此前失败的歌单加载；后台播放事件不清除此提示。
+      setFailedPlaylist(null);
       endedRef.current = false;
       if (!track.visible) {
         patch({ error: `「${track.name}」暂时无法播放` });
