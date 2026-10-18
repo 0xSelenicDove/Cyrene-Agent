@@ -57,6 +57,7 @@ describe("music playlist loading", () => {
     expect(capture.props!.state.queue).toHaveLength(61);
     expect(capture.props!.state.queue[60].encryptedId).toBe("song-60");
     expect(capture.props!.state.error).toBeUndefined();
+    expect(capture.props!.playlistLoadError).toBeUndefined();
   });
 
   it.each(["structured", "exception"])("keeps the previous queue and playlist on %s failure and shows an error", async (kind) => {
@@ -68,7 +69,14 @@ describe("music playlist loading", () => {
     await act(async () => { capture.props!.actions.loadPlaylist(playlist("failed")); });
     expect(capture.props!.activePlaylistId).toBe("previous");
     expect(capture.props!.state.queue).toEqual(previous);
-    expect(capture.props!.state.error).toBeTruthy();
+    expect(capture.props!.playlistLoadError?.message).toBeTruthy();
+    expect(capture.props!.state.error).toBeUndefined();
+    api.mockResolvedValue({ ok: true, data: { tracks: tracks(61) } });
+    await act(async () => { capture.props!.playlistLoadError!.onRetry(); });
+    expect(api.mock.calls.map(([id]) => id)).toEqual(["failed", "failed"]);
+    expect(capture.props!.activePlaylistId).toBe("failed");
+    expect(capture.props!.state.queue).toHaveLength(61);
+    expect(capture.props!.playlistLoadError).toBeUndefined();
   });
 
   it.each(["success", "failure"])("ignores stale %s after a newer playlist has loaded", async (kind) => {

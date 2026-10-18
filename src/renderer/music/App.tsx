@@ -198,6 +198,7 @@ export function App() {
   const [cacheTracks, setCacheTracks] = useState<Track[]>([]);
   const [activePlaylistId, setActivePlaylistId] = useState("");
   const playlistLoadSeq = useRef(0);
+  const [failedPlaylist, setFailedPlaylist] = useState<Playlist | null>(null);
   // 同步网易云歌单最新值给 onStateChanged 回调用，避免闭包陷阱导致重复拉取
   const neteasePlaylistsRef = useRef<Playlist[]>([]);
   const [searchResults, setSearchResults] = useState<Track[]>([]);
@@ -549,6 +550,7 @@ export function App() {
     async (playlist: Playlist) => {
       if (!api) return;
       const seq = ++playlistLoadSeq.current;
+      setFailedPlaylist(null);
       // 缓存歌单：tracks 已在内存（cacheTracks 快照），不调 API
       if (playlist.id === LOCAL_CACHE_PLAYLIST_ID) {
         setActivePlaylistId(playlist.id);
@@ -584,12 +586,12 @@ export function App() {
             error: undefined,
           }));
         } else {
-          setState((s) => ({ ...s, error: "歌单加载失败，请稍后重试" }));
+          setFailedPlaylist(playlist);
         }
       } catch (err) {
         if (seq !== playlistLoadSeq.current) return;
         console.warn("[music] getPlaylistDetail failed", err);
-        setState((s) => ({ ...s, error: "歌单加载失败，请稍后重试" }));
+        setFailedPlaylist(playlist);
       }
     },
     [api, applyModeForPlaylist],
@@ -916,6 +918,10 @@ export function App() {
       {kernelMissing && <MpvKernelWarning />}
       <MusicPlayer
         state={state}
+        playlistLoadError={failedPlaylist ? {
+          message: "歌单加载失败，请稍后重试",
+          onRetry: () => { void loadPlaylistTracks(failedPlaylist); },
+        } : undefined}
         actions={actions}
         playlists={playlists}
         activePlaylistId={activePlaylistId}
