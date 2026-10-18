@@ -201,10 +201,10 @@ describe("表单 ↔ JSON 条目双向同步", () => {
   });
 
   it.each([
-    { args: ["valid", 1] },
+    { args: ["valid", { port: 3000 }] },
     { args: [null] },
     { args: [["nested"]] },
-  ])("切换时保留非字符串参数，在添加时拒绝：%j", ({ args }) => {
+  ])("切换时保留不支持的参数类型，在添加时拒绝：%j", ({ args }) => {
     const entry = { command: "node", args };
     const patch = entryToFormPatch("demo", entry);
     const converted = formToEntry({ ...makeForm({}), ...patch });
@@ -255,13 +255,50 @@ describe("表单 ↔ JSON 条目双向同步", () => {
 });
 
 describe("entryToConfig（后端配置组装）", () => {
+  it("超出数值范围的 JSON 参数仍按原有字符串转换处理，模式往返不会变成 null", () => {
+    const [{ name, entry }] = parseJsonServers('{"mcpServers":{"demo":{"command":"node","args":[1e400,-1e400,3000,false]}}}');
+    const expected = ["Infinity", "-Infinity", "3000", "false"];
+    expect(entryToConfig(name, entry, []).args).toEqual(expected);
+
+    const patch = entryToFormPatch(name, entry);
+    const converted = formToEntry({ ...makeForm({}), ...patch });
+    expect(converted.args).toEqual(["Infinity", "-Infinity", 3000, false]);
+    expect(entryToConfig(name, JSON.parse(JSON.stringify(converted)), []).args).toEqual(expected);
+
+    const fromForm = formToEntry(makeForm({ command: "node", args: "[1e400,-1e400,3000,false]" }));
+    expect(fromForm.args).toEqual(["Infinity", "-Infinity", 3000, false]);
+    expect(entryToConfig(name, JSON.parse(JSON.stringify(fromForm)), []).args).toEqual(expected);
+  });
+
+  it.each([
+    { args: ["--port", 3000], expected: ["--port", "3000"] },
+    { args: ["--enabled", true, "--disabled", false], expected: ["--enabled", "true", "--disabled", "false"] },
+    { args: [0, -42, 1.25, 1e3], expected: ["0", "-42", "1.25", "1000"] },
+    { args: ["C:\\My Folder\\server.js", "", "hello world", 3000, false], expected: ["C:\\My Folder\\server.js", "", "hello world", "3000", "false"] },
+  ])("兼容数字和布尔参数，直接提交与模式往返后的配置一致：%j", ({ args, expected }) => {
+    const [{ name, entry }] = parseJsonServers(JSON.stringify({ mcpServers: { demo: { command: "node", args } } }));
+    expect(entryToConfig(name, entry, []).args).toEqual(expected);
+
+    const patch = entryToFormPatch(name, entry);
+    const converted = formToEntry({ ...makeForm({}), ...patch });
+    expect(converted).toEqual(entry);
+    expect(entryToConfig(name, converted, []).args).toEqual(expected);
+    // 校验只构造提交配置，不修改编辑中的原始草稿。
+    expect(entry.args).toEqual(args);
+    expect(converted.args).toEqual(args);
+  });
+
   it.each([
     { args: null },
     { args: "--label hello" },
-    { args: [1, 2] },
+    { args: 3000 },
+    { args: false },
     { args: [null] },
+    { args: [{ port: 3000 }] },
     { args: [["nested"]] },
-  ])("JSON 直接提交时拒绝非字符串数组：%j", ({ args }) => {
+    { args: ["--port", 3000, true, null] },
+    { args: ["--port", 3000, false, "bad\npath"] },
+  ])("JSON 直接提交时拒绝非数组或包含不支持值的参数：%j", ({ args }) => {
     expect(() => entryToConfig("demo", { command: "node", args }, [])).toThrow();
   });
 

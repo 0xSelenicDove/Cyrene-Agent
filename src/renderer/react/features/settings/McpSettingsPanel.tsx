@@ -17,7 +17,7 @@ interface McpFormState {
   name: string;
   transport: McpTransport;
   command: string;   // stdio：启动命令
-  args: string;      // stdio：参数（空格分隔或 JSON 字符串数组）
+  args: string;      // stdio：参数（空格分隔或 JSON 数组）
   url: string;       // 远程：服务地址
   env: string;       // stdio：环境变量 JSON 文本
   headers: string;   // 远程：请求头 JSON 文本
@@ -31,9 +31,17 @@ class McpArgsError extends Error {}
 const MCP_ARG_CONTROL_CHARS = /[\u0000-\u001f]/;
 
 function validateArgs(value: unknown): string[] {
-  // 两种输入模式共用校验，避免 JSON 直接提交时把错误路径传给进程。
-  if (Array.isArray(value) && value.every((arg) => typeof arg === "string" && !MCP_ARG_CONTROL_CHARS.test(arg))) return value;
-  throw new McpArgsError("Expected a JSON array of strings without control characters");
+  // 两种输入模式共用校验；沿用数字/布尔参数的字符串转换，避免破坏已有配置。
+  if (Array.isArray(value) && value.every((arg) =>
+    typeof arg === "number" || typeof arg === "boolean"
+    || (typeof arg === "string" && !MCP_ARG_CONTROL_CHARS.test(arg))
+  )) return value.map(String);
+  throw new McpArgsError("Expected a JSON array of strings, numbers or booleans without control characters");
+}
+
+function normalizeDraftArgs(args: unknown[]): unknown[] {
+  // 1e400 等 JSON 数字会解析为 Infinity；先沿用字符串转换，避免再序列化时变成 null。
+  return args.map((arg) => typeof arg === "number" && !Number.isFinite(arg) ? String(arg) : arg);
 }
 
 function splitArgs(text: string): unknown[] {
@@ -47,13 +55,14 @@ function splitArgs(text: string): unknown[] {
     throw new McpArgsError("Invalid JSON argument array");
   }
   if (!Array.isArray(parsed)) throw new McpArgsError("Expected a JSON argument array");
-  return parsed;
+  return normalizeDraftArgs(parsed);
 }
 
 function formatArgs(args: unknown[]): string {
-  // 切换只转换格式，不能把错误类型自动改成字符串而绕过添加时的校验。
-  if (args.some((arg) => typeof arg !== "string")) return JSON.stringify(args);
-  const values = args.map(String);
+  // 保留草稿原始类型，避免对象或 null 被字符串化后绕过添加时的校验。
+  const draftArgs = normalizeDraftArgs(args);
+  if (draftArgs.some((arg) => typeof arg !== "string")) return JSON.stringify(draftArgs);
+  const values = draftArgs.map(String);
   const plain = values.join(" ");
   // 保留 argv 边界；控制字符也留在 JSON 中，避免绕过数组校验。
   return plain.startsWith("[") || values.some((arg) => arg === "" || /\s/.test(arg) || MCP_ARG_CONTROL_CHARS.test(arg))

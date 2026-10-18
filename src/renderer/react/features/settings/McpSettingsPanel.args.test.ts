@@ -69,7 +69,7 @@ async function setText(id: string, value: string) {
   });
 }
 
-async function openJson(args: string[]) {
+async function openJson(args: unknown[]) {
   await act(async () => root.render(createElement(McpSettingsPanel)));
   await clickControl("addServer");
   await clickControl("jsonMode");
@@ -124,6 +124,109 @@ describe("MCP 参数在模式切换和提交时保留边界", () => {
     await clickControl("confirm");
 
     expectSubmittedArgs(args);
+  });
+
+  it.each([
+    { source: "json", switchModes: false },
+    { source: "form", switchModes: false },
+    { source: "json", switchModes: true },
+    { source: "form", switchModes: true },
+  ] as const)("数字和布尔参数从 $source 输入、切换=$switchModes 时保留草稿并在添加时转成字符串", async ({ source, switchModes }) => {
+    const mixedArgs = ["--port", 3000, true, false, 0, ...args];
+    await openJson(source === "json" ? mixedArgs : []);
+    if (source === "form") {
+      await clickControl("formMode");
+      await setText("cy-mcp-args", JSON.stringify(mixedArgs));
+    }
+
+    if (switchModes) {
+      for (let round = 0; round < 2; round++) {
+        if (source === "json") await clickControl("formMode");
+        expect(JSON.parse(document.querySelector<HTMLInputElement>("#cy-mcp-args")!.value)).toEqual(mixedArgs);
+        expect(document.querySelector('[role="alert"]')).toBeNull();
+        await clickControl("jsonMode");
+        expect(JSON.parse(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")!.value)).toEqual({
+          mcpServers: { demo: { command: "node", args: mixedArgs, env: { EXAMPLE_ONLY: "unchanged" } } },
+        });
+        expect(document.querySelector('[role="alert"]')).toBeNull();
+        if (source === "form") await clickControl("formMode");
+      }
+    }
+    expect(addMcpServer).not.toHaveBeenCalled();
+    await clickControl("confirm");
+
+    expectSubmittedArgs(["--port", "3000", "true", "false", "0", ...args]);
+  });
+
+  it.each(["json", "form"] as const)("%s 中超大指数参数往返时不会变成 null，普通数字和布尔草稿保持原类型", async (source) => {
+    const argsText = '["--limit",1e400,-1e400,3000,false]';
+    const convertedDraft = ["--limit", "Infinity", "-Infinity", 3000, false];
+    await openJson([]);
+    if (source === "json") {
+      await setText("cy-mcp-json", `{"mcpServers":{"demo":{"command":"node","args":${argsText},"env":{"EXAMPLE_ONLY":"unchanged"}}}}`);
+    } else {
+      await clickControl("formMode");
+      await setText("cy-mcp-args", argsText);
+      await clickControl("jsonMode");
+    }
+
+    for (let round = 0; round < 2; round++) {
+      await clickControl("formMode");
+      expect(JSON.parse(document.querySelector<HTMLInputElement>("#cy-mcp-args")!.value)).toEqual(convertedDraft);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+      await clickControl("jsonMode");
+      expect(JSON.parse(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")!.value).mcpServers.demo.args).toEqual(convertedDraft);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+    }
+    expect(addMcpServer).not.toHaveBeenCalled();
+    if (source === "form") await clickControl("formMode");
+    await clickControl("confirm");
+
+    expectSubmittedArgs(["--limit", "Infinity", "-Infinity", "3000", "false"]);
+  });
+
+  it.each([
+    { source: "json", invalidArg: null },
+    { source: "json", invalidArg: { port: 3000 } },
+    { source: "json", invalidArg: ["nested"] },
+    { source: "form", invalidArg: null },
+    { source: "form", invalidArg: { port: 3000 } },
+    { source: "form", invalidArg: ["nested"] },
+  ] as const)("$source 中混合数字、布尔和无效参数 $invalidArg 时不转换成字符串绕过校验", async ({ source, invalidArg }) => {
+    const mixedArgs = ["--port", 3000, true, false, "", invalidArg];
+    await openJson(source === "json" ? mixedArgs : []);
+    if (source === "form") {
+      await clickControl("formMode");
+      await setText("cy-mcp-args", JSON.stringify(mixedArgs));
+      await clickControl("jsonMode");
+    } else {
+      await clickControl("formMode");
+      await clickControl("jsonMode");
+    }
+    expect(JSON.parse(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")!.value).mcpServers.demo.args).toEqual(mixedArgs);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    if (source === "form") await clickControl("formMode");
+
+    await clickControl("confirm");
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
+    expect(addMcpServer).not.toHaveBeenCalled();
+  });
+
+  it.each([null, { port: 3000 }, ["nested"], "C:\nfolder.js"])("多服务器中混合数字、布尔和无效参数 %j 时，所有服务器都不会提交", async (invalidArg) => {
+    await openJson([]);
+    const input = JSON.stringify({
+      mcpServers: {
+        first: { command: "node", args: ["server.js", "--port", 3000, true] },
+        second: { command: "node", args: ["--port", 3001, false, invalidArg] },
+      },
+    });
+    await setText("cy-mcp-json", input);
+    await clickControl("confirm");
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
+    expect(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")?.value).toBe(input);
+    expect(addMcpServer).not.toHaveBeenCalled();
   });
 
   it.each([
