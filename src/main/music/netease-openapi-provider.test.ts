@@ -91,6 +91,50 @@ describe("NeteaseOpenapiProvider", () => {
     );
   });
 
+  it.each([0, 1, 2])("playPlaylist: binds the URL to playable track %i without reordering the queue", async (selected) => {
+    const c = makeClient();
+    const records = [ENC, ENC2, "C".repeat(32)].map((id, index) => ({
+      ...songRec, id, name: `song ${index}`,
+    }));
+    c.getPlaylistSongs.mockResolvedValue(records);
+    c.getSongDetail.mockImplementation(async (id: string) => ({
+      playUrl: id === records[selected].id ? "https://example.test/selected.mp3" : "",
+    }));
+    const dispatch = vi.fn().mockResolvedValue({ state: "dispatched" });
+    const p = new NeteaseOpenapiProvider(c as unknown as NeteaseOpenapiClient, dispatch);
+
+    await p.playPlaylist("pl");
+
+    expect(c.getSongDetail.mock.calls.map(([id]) => id)).toEqual(records.slice(0, selected + 1).map(({ id }) => id));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledWith({
+      kind: "playlist",
+      playUrl: "https://example.test/selected.mp3",
+      selectedTrack: expect.objectContaining({ id: records[selected].id, name: records[selected].name }),
+      tracks: records.map(({ id }) => expect.objectContaining({ id })),
+    });
+  });
+
+  it("playPlaylist: no playable URL never dispatches", async () => {
+    const c = makeClient();
+    c.getPlaylistSongs.mockResolvedValue([songRec, { ...songRec, id: ENC2 }]);
+    c.getSongDetail.mockResolvedValue({ playUrl: "" });
+    const dispatch = vi.fn();
+    const p = new NeteaseOpenapiProvider(c as unknown as NeteaseOpenapiClient, dispatch);
+    await expect(p.playPlaylist("pl")).rejects.toThrow("E_PLAYLIST_NOT_PLAYABLE");
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("playPlaylist: URL lookup failure never dispatches a mismatched fallback", async () => {
+    const c = makeClient();
+    c.getPlaylistSongs.mockResolvedValue([songRec, { ...songRec, id: ENC2 }]);
+    c.getSongDetail.mockResolvedValueOnce({ playUrl: "" }).mockRejectedValueOnce(new Error("detail unavailable"));
+    const dispatch = vi.fn();
+    const p = new NeteaseOpenapiProvider(c as unknown as NeteaseOpenapiClient, dispatch);
+    await expect(p.playPlaylist("pl")).rejects.toThrow("detail unavailable");
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it("playPlaylist: empty playlist → E_PLAYLIST_EMPTY", async () => {
     const c = makeClient();
     c.getPlaylistSongs.mockResolvedValue([]);
@@ -186,7 +230,7 @@ describe("playlist song pagination", () => {
     expect(detail.tracks).toHaveLength(70 + visible);
     client.getPlaylistSongs.mockClear();
     await provider.playPlaylist("playlist");
-    expect(dispatch).toHaveBeenCalledWith({ kind: "playlist", playUrl: "https://example.test/song.mp3", tracks: detail.tracks });
+    expect(dispatch).toHaveBeenCalledWith({ kind: "playlist", playUrl: "https://example.test/song.mp3", tracks: detail.tracks, selectedTrack: detail.tracks[0] });
     expect(client.getPlaylistSongs.mock.calls.map((args) => args[2])).toEqual([0, 30, 60, 90]);
     expect(client.getSongDetail).toHaveBeenCalledWith(detail.tracks[0].id);
   });
@@ -206,7 +250,7 @@ describe("playlist song pagination", () => {
     expect(detail.tracks.map((track) => track.id)).toEqual([records[60].id]);
     expect(client.getPlaylistSongs.mock.calls.map((args) => args[2])).toEqual([0, 30, 60]);
     await provider.playPlaylist("playlist");
-    expect(dispatch).toHaveBeenCalledWith({ kind: "playlist", playUrl: "https://example.test/song.mp3", tracks: detail.tracks });
+    expect(dispatch).toHaveBeenCalledWith({ kind: "playlist", playUrl: "https://example.test/song.mp3", tracks: detail.tracks, selectedTrack: detail.tracks[0] });
   });
 
   it("does not treat pages without reliable identities as proof of a repeated page", async () => {
