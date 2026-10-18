@@ -534,6 +534,25 @@ describe("MusicService (M3 OpenAPI)", () => {
     expect(await s.getMySubscriptions("artists")).toEqual([]);
   });
 
+  it("loads later playlist pages through the real provider before playback", async () => {
+    const records = Array.from({ length: 61 }, (_, index) => ({
+      ...songRec(), id: (index + 1).toString(16).padStart(32, "0"), visible: index >= 30,
+    }));
+    mocks.getPlaylistDetail.mockResolvedValue({ id: "a".repeat(32), name: "list", trackCount: 61 });
+    mocks.getPlaylistSongs.mockImplementation((_id, limit, offset) => Promise.resolve(records.slice(offset, offset + limit)));
+    mocks.getSongDetail.mockResolvedValue({ name: "later song", playUrl: "https://example.test/later.mp3" });
+    const s = makeService();
+    await s.start();
+    (s as unknown as { orchestrator: { setAccountState: (st: string) => void } }).orchestrator.setAccountState("signed_in");
+
+    expect((await s.getPlaylistDetail("a".repeat(32))).tracks.map((track) => track.id)).toEqual(records.slice(30).map((record) => record.id));
+    mocks.getPlaylistSongs.mockClear();
+    expect((await s.playPlaylist("a".repeat(32))).state).toBe("dispatched");
+    expect(mocks.getPlaylistSongs.mock.calls.map((args) => args[2])).toEqual([0, 30, 60]);
+    expect(mocks.getSongDetail).toHaveBeenCalledWith(records[30].id);
+    expect(mpvMocks.load).toHaveBeenCalledWith("https://example.test/later.mp3", "replace");
+  });
+
   it("removeFromPlaylist delegates to provider and validates input", async () => {
     mocks.removeSongsFromPlaylist.mockResolvedValue({ count: 1 });
     const s = makeService();
