@@ -412,6 +412,7 @@ packages/plugin-sdk/   # @playa0v0/cyrene-plugin-sdk 源码
 ## <img src="./docs/image/icons/book-open.svg" width="20" height="20" alt=""> 深入阅读
 
 - **[CyreneHarness 核心引擎](./docs/references/cyrene-harness.md)** — 主循环、CTA 会话轨迹、双层压缩与缓存体系、四种终止状态的设计细节。
+- **[更新日志](./CHANGELOG.md)** — 每个版本的新增、修复与重构，由 `pnpm run release` 从提交记录自动生成。
 
 ---
 
