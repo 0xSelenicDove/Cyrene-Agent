@@ -37,6 +37,9 @@ export function normalizeAddressInput(input: string): string {
   // 主机部分为空（`\\server\share` 这类 UNC 路径、`/path`）不是网址；
   // 只有主机部分出现空白才视为普通文字（如 `cyrene agent`），路径 / 查询里的空格由解析器编码
   if (!authority || /\s/.test(authority)) return input;
+  // 主机部分带 `@` 即带用户信息（含 `@example.com` 这类空用户名、解析后 username 为空的形态），不补全；
+  // 路径里的 `@`（`medium.com/@user`）不在主机部分，不受影响
+  if (authority.includes("@")) return input;
 
   // 已带协议（含 http/https 以外的协议）一律不动；`localhost:3000` 这类「主机:端口」不算协议
   if (hasExplicitScheme(candidate)) return input;
@@ -47,7 +50,6 @@ export function normalizeAddressInput(input: string): string {
   } catch {
     return input;
   }
-  if (url.username || url.password) return input;
 
   const kind = classifyHost(url.hostname, authority);
   if (kind === "local") return `http://${candidate}`;

@@ -66,6 +66,7 @@ const FULLWIDTH: Rewrite[] = [
 
 const MISC_SHAPES: Rewrite[] = [
   ["//example.com/path", "https://example.com/path"],
+  ["medium.com/@cyrene", "https://medium.com/@cyrene"],
   ["localhost.", "http://localhost."],
   ["127.0.0.1.", "http://127.0.0.1."],
   ["example.com/search?q=cyrene agent", "https://example.com/search?q=cyrene agent"],
@@ -107,6 +108,11 @@ const UNCHANGED: Unchanged[] = [
   ["1.2.3", "invalid_url"],
   ["0x7f.0.0.1", "invalid_url"],
   ["user@example.com", "invalid_url"],
+  ["@example.com", "invalid_url"],
+  [":@example.com", "invalid_url"],
+  ["@localhost:3000", "invalid_url"],
+  // `user:` 按 URL 语法就是协议前缀，控制器照旧报「不支持的协议」
+  ["user:pass@localhost:3000", "unsupported_protocol"],
   ["-bad-.com", "invalid_url"],
   ["999.1.1.1", "invalid_url"],
   ["[foo]:80", "invalid_url"],
