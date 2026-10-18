@@ -177,7 +177,7 @@ describe("表单 ↔ JSON 条目双向同步", () => {
 
   it.each([
     ["C:\\My Folder\\server.js", "--label", "hello world"],
-    ["", " ", "\t", "first\nsecond"],
+    ["", " ", "  padded value  "],
     ['say "hello"', "C:\\folder\\", "a\\b", "'quoted'"],
     ["[value]", "--flag"],
     ["[", "--flag"],
@@ -191,10 +191,57 @@ describe("表单 ↔ JSON 条目双向同步", () => {
     expect(formToEntry(makeForm({ command: "node", args: '["hello world", ""]' })))
       .toEqual({ command: "node", args: ["hello world", ""] });
     expect(formToEntry(makeForm({ command: "node", args: "[]" }))).toEqual({ command: "node" });
+    expect(formToEntry(makeForm({ command: "node", args: String.raw`["\u4e2d\u6587", ""]` })))
+      .toEqual({ command: "node", args: ["中文", ""] });
   });
 
-  it.each(['["unfinished"', '["valid", 1]', '[null]', '[["nested"]]'])("拒绝损坏或非字符串的参数数组：%s", (args) => {
+  it("不能转换尚未写完的参数数组", () => {
+    const args = '["unfinished"';
     expect(() => formToEntry(makeForm({ command: "node", args }))).toThrow();
+  });
+
+  it.each([
+    { args: ["valid", 1] },
+    { args: [null] },
+    { args: [["nested"]] },
+  ])("切换时保留非字符串参数，在添加时拒绝：%j", ({ args }) => {
+    const entry = { command: "node", args };
+    const patch = entryToFormPatch("demo", entry);
+    const converted = formToEntry({ ...makeForm({}), ...patch });
+    expect(converted).toEqual(entry);
+    expect(() => entryToConfig("demo", converted, [])).toThrow();
+  });
+
+  it.each([
+    String.raw`["C:\new\tool.js", "--label", "hello world"]`,
+    String.raw`["D:\temp\file"]`,
+    String.raw`["C:\repo\bin"]`,
+  ])("单反斜杠路径允许转换，但添加时拒绝控制字符：%s", (args) => {
+    const entry = formToEntry(makeForm({ command: "node", args }));
+    expect(entry.args).toEqual(JSON.parse(args));
+    expect(() => entryToConfig("demo", entry, [])).toThrow();
+  });
+
+  it.each(Array.from({ length: 32 }, (_, code) => code))("拒绝参数中的 C0 控制字符：%i", (code) => {
+    const args = JSON.stringify([`before${String.fromCharCode(code)}after`]);
+    expect(formToEntry(makeForm({ command: "node", args })).args).toEqual(JSON.parse(args));
+    expect(() => entryToConfig("demo", { command: "node", args: JSON.parse(args) }, [])).toThrow();
+  });
+
+  it("接受正确双写反斜杠的 Windows 路径，并保留空参数", () => {
+    const args = String.raw`["C:\\new\\tool.js", "D:\\temp\\file", "C:\\repo\\bin", ""]`;
+    expect(formToEntry(makeForm({ command: "node", args }))).toEqual({
+      command: "node",
+      args: ["C:\\new\\tool.js", "D:\\temp\\file", "C:\\repo\\bin", ""],
+    });
+  });
+
+  it("普通文本参数仍按空白分隔，保留单反斜杠路径", () => {
+    const args = "C:\\new\\tool.js\t--label\nhello";
+    expect(formToEntry(makeForm({ command: "node", args }))).toEqual({
+      command: "node",
+      args: ["C:\\new\\tool.js", "--label", "hello"],
+    });
   });
 
   it("http 往返：url 和 headers 恢复", () => {
@@ -208,6 +255,26 @@ describe("表单 ↔ JSON 条目双向同步", () => {
 });
 
 describe("entryToConfig（后端配置组装）", () => {
+  it.each([
+    { args: null },
+    { args: "--label hello" },
+    { args: [1, 2] },
+    { args: [null] },
+    { args: [["nested"]] },
+  ])("JSON 直接提交时拒绝非字符串数组：%j", ({ args }) => {
+    expect(() => entryToConfig("demo", { command: "node", args }, [])).toThrow();
+  });
+
+  it("允许省略参数或显式传入空数组", () => {
+    expect(entryToConfig("demo", { command: "node" }, []).args).toBeUndefined();
+    expect(entryToConfig("demo", { command: "node", args: [] }, []).args).toEqual([]);
+  });
+
+  it("JSON 直接提交时保留正确转义的 Windows 路径和空参数", () => {
+    const [{ name, entry }] = parseJsonServers(String.raw`{"mcpServers":{"demo":{"command":"node","args":["C:\\new\\tool.js","hello world",""]}}}`);
+    expect(entryToConfig(name, entry, []).args).toEqual(["C:\\new\\tool.js", "hello world", ""]);
+  });
+
   it("保留空字符串参数的位置", () => {
     const args = ["", "--label", "", "hello world"];
     expect(entryToConfig("demo", { command: "node", args }, []).args).toEqual(args);

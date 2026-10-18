@@ -1708,7 +1708,7 @@
       "commandPlaceholder": "npx",
       "args": "Arguments (space separated or JSON array)",
       "argsPlaceholder": "-y @modelcontextprotocol/server-memory",
-      "argsInvalid": "Arguments starting with [ must be a JSON array of strings, e.g. [\"hello world\", \"\"].",
+      "argsInvalid": "Check the argument format. When using brackets, follow this example: [\"C:\\\\new\\\\tool.js\", \"hello world\"]. Write each path backslash twice.",
       "url": "URL",
       "urlPlaceholder": "https://mcp.example.com/mcp",
       "advanced": "Advanced",

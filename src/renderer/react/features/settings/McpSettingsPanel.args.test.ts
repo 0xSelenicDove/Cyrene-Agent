@@ -11,7 +11,9 @@ vi.mock("../../i18n", () => ({
 }));
 vi.mock("@lobehub/icons", () => ({ MCP: () => null }));
 
-const addMcpServer = vi.fn(async (_config: McpServerConfigView) => ({ ok: true, toolIds: [] }));
+const addMcpServer = vi.fn(async (_config: McpServerConfigView): Promise<{
+  ok: boolean; toolIds?: string[]; error?: string;
+}> => ({ ok: true, toolIds: [] }));
 let host: HTMLDivElement;
 let root: Root;
 
@@ -36,7 +38,8 @@ beforeEach(() => {
     getGeneral: vi.fn(async () => ({})),
     addMcpServer,
   });
-  addMcpServer.mockClear();
+  addMcpServer.mockReset();
+  addMcpServer.mockResolvedValue({ ok: true, toolIds: [] });
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
@@ -90,8 +93,8 @@ describe("MCP 参数在模式切换和提交时保留边界", () => {
     'say "hello"',
     "C:\\tools\\",
     "",
-    "first\nsecond",
-    "left\tright",
+    "first\\nsecond",
+    "left\\tright",
   ];
 
   it("反复切换 JSON → 表单 → JSON 后参数及其他字段保持不变", async () => {
@@ -123,6 +126,51 @@ describe("MCP 参数在模式切换和提交时保留边界", () => {
     expectSubmittedArgs(args);
   });
 
+  it.each([
+    String.raw`C:\new\tool.js`,
+    String.raw`D:\temp\file`,
+  ])("直接提交 JSON 时先校验单反斜杠路径，保留草稿并允许修正：%s", async (path) => {
+    await openJson([]);
+    // 保留用户实际敲入的单反斜杠，不能用 JSON.stringify 自动修正输入。
+    const input = String.raw`{"mcpServers":{"demo":{"command":"node","args":["${path}","--label","hello world"],"env":{"EXAMPLE_ONLY":"unchanged"}}}}`;
+    await setText("cy-mcp-json", input);
+    await clickControl("confirm");
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
+    expect(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")?.value).toBe(input);
+    expect(addMcpServer).not.toHaveBeenCalled();
+
+    const correctedArgs = [path, "--label", "hello world"];
+    await setText("cy-mcp-json", JSON.stringify({
+      mcpServers: { demo: { command: "node", args: correctedArgs, env: { EXAMPLE_ONLY: "unchanged" } } },
+    }));
+    await clickControl("confirm");
+    expectSubmittedArgs(correctedArgs);
+  });
+
+  it("多服务器 JSON 中后一个参数无效时，前一个服务器也不会提前提交", async () => {
+    await openJson([]);
+    const input = String.raw`{"mcpServers":{"first":{"command":"node","args":["server.js"]},"second":{"command":"node","args":["C:\new\tool.js"]}}}`;
+    await setText("cy-mcp-json", input);
+    await clickControl("confirm");
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
+    expect(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")?.value).toBe(input);
+    expect(addMcpServer).not.toHaveBeenCalled();
+  });
+
+  it("正确参数通过校验后连接失败，仍显示添加失败提示并保留配置", async () => {
+    await openJson(args);
+    const input = document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")!.value;
+    addMcpServer.mockResolvedValueOnce({ ok: false, error: "MCP error -32000: Connection closed" });
+    await clickControl("confirm");
+
+    expectSubmittedArgs(args);
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.addFailed");
+    expect(document.querySelector('[role="alert"]')?.textContent).not.toContain("settingsPage.mcp.argsInvalid");
+    expect(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")?.value).toBe(input);
+  });
+
   it("表单中的普通空格分隔参数仍可切换并正常提交", async () => {
     await openJson([]);
     await clickControl("formMode");
@@ -134,23 +182,152 @@ describe("MCP 参数在模式切换和提交时保留边界", () => {
     expectSubmittedArgs(["-y", "@modelcontextprotocol/server-memory"]);
   });
 
-  it("参数 JSON 无效时保留表单草稿且阻止提交，修正后可以提交", async () => {
+  it.each([
+    String.raw`C:\new\tool.js`,
+    String.raw`D:\temp\file`,
+  ])("含控制字符的 JSON 参数允许反复切换，只在添加时提示并允许修正：%s", async (path) => {
+    await openJson([]);
+    const input = String.raw`{"mcpServers":{"demo":{"command":"node","args":["${path}","hello world"],"env":{"EXAMPLE_ONLY":"unchanged"}}}}`;
+    await setText("cy-mcp-json", input);
+    const original = JSON.parse(input);
+
+    for (let round = 0; round < 3; round++) {
+      await clickControl("formMode");
+      expect(JSON.parse(document.querySelector<HTMLInputElement>("#cy-mcp-args")!.value))
+        .toEqual(original.mcpServers.demo.args);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+      await clickControl("jsonMode");
+      expect(JSON.parse(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")!.value)).toEqual(original);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+    }
+    expect(addMcpServer).not.toHaveBeenCalled();
+
+    await clickControl("confirm");
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
+    expect(addMcpServer).not.toHaveBeenCalled();
+
+    const correctedArgs = [path, "hello world"];
+    await setText("cy-mcp-json", JSON.stringify({
+      mcpServers: { demo: { command: "node", args: correctedArgs, env: { EXAMPLE_ONLY: "unchanged" } } },
+    }));
+    await clickControl("confirm");
+    expectSubmittedArgs(correctedArgs);
+  });
+
+  it.each([
+    String.raw`["C:\new\tool.js", "--label", "hello world"]`,
+    String.raw`["D:\temp\file"]`,
+  ])("表单参数中的单反斜杠允许切换，添加时才校验：%s", async (input) => {
     await openJson(["original"]);
     await clickControl("formMode");
-    await setText("cy-mcp-args", '["unterminated');
+    await setText("cy-mcp-args", input);
     await clickControl("jsonMode");
 
+    const json = document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")!.value;
+    expect(JSON.parse(json).mcpServers.demo.args).toEqual(JSON.parse(input));
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    await clickControl("formMode");
+    expect(JSON.parse(document.querySelector<HTMLInputElement>("#cy-mcp-args")!.value)).toEqual(JSON.parse(input));
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(addMcpServer).not.toHaveBeenCalled();
+
+    await clickControl("confirm");
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
+    expect(addMcpServer).not.toHaveBeenCalled();
+
+    const correctedArgs = ["C:\\new\\tool.js", "hello world", ""];
+    await setText("cy-mcp-args", JSON.stringify(correctedArgs));
+    await clickControl("confirm");
+    expectSubmittedArgs(correctedArgs);
+  });
+
+  it("表单残缺参数草稿切换时不报错，添加时回到表单校验而不提交旧 JSON", async () => {
+    await openJson(["original"]);
+    await clickControl("formMode");
+    const input = '["unterminated';
+    await setText("cy-mcp-args", input);
+
+    await clickControl("jsonMode");
+    expect(document.querySelector("#cy-mcp-json")).not.toBeNull();
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    await clickControl("formMode");
+    expect(document.querySelector<HTMLInputElement>("#cy-mcp-args")?.value).toBe(input);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+
+    await clickControl("jsonMode");
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    await clickControl("confirm");
     expect(document.querySelector("#cy-mcp-json")).toBeNull();
-    expect(document.querySelector<HTMLInputElement>("#cy-mcp-args")?.value).toBe('["unterminated');
+    expect(document.querySelector<HTMLInputElement>("#cy-mcp-args")?.value).toBe(input);
     expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
     expect(addMcpServer).not.toHaveBeenCalled();
 
+    const correctedArgs = ["C:\\new\\tool.js", "hello world", ""];
+    await setText("cy-mcp-args", JSON.stringify(correctedArgs));
+    await clickControl("confirm");
+    expectSubmittedArgs(correctedArgs);
+  });
+
+  it("残缺 JSON 草稿切换时不报错，添加时回到 JSON 校验而不提交旧表单", async () => {
+    await openJson(["original"]);
+    await clickControl("formMode");
+    await clickControl("jsonMode");
+    const input = '{"mcpServers":{"demo":{"command":"node","args":[';
+    await setText("cy-mcp-json", input);
+
+    await clickControl("formMode");
+    expect(document.querySelector("#cy-mcp-args")).not.toBeNull();
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    await clickControl("jsonMode");
+    expect(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")?.value).toBe(input);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+
+    await clickControl("formMode");
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    await clickControl("confirm");
+    expect(document.querySelector("#cy-mcp-args")).toBeNull();
+    expect(document.querySelector<HTMLTextAreaElement>("#cy-mcp-json")?.value).toBe(input);
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.jsonInvalid");
+    expect(addMcpServer).not.toHaveBeenCalled();
+
+    await setText("cy-mcp-json", JSON.stringify({
+      mcpServers: { demo: { command: "node", args, env: { EXAMPLE_ONLY: "unchanged" } } },
+    }));
+    await clickControl("confirm");
+    expectSubmittedArgs(args);
+  });
+
+  it.each(["json", "form"] as const)("清空 %s 草稿后切换不会提交另一边的旧配置", async (source) => {
+    await openJson(["original"]);
+    await clickControl("formMode");
+    if (source === "json") {
+      await clickControl("jsonMode");
+      await setText("cy-mcp-json", "");
+      await clickControl("formMode");
+    } else {
+      await setText("cy-mcp-name", "");
+      await setText("cy-mcp-command", "");
+      await setText("cy-mcp-args", "");
+      await clickControl("jsonMode");
+    }
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    await clickControl("confirm");
+
+    const expectedError = source === "json" ? "jsonEmpty" : "nameRequired";
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(`settingsPage.mcp.${expectedError}`);
+    const sourceInput = source === "json" ? "#cy-mcp-json" : "#cy-mcp-name";
+    expect(document.querySelector<HTMLInputElement | HTMLTextAreaElement>(sourceInput)?.value).toBe("");
+    expect(addMcpServer).not.toHaveBeenCalled();
+  });
+
+  it.each(["\b", "\u0000", "\u001b"])("JSON 导入的非空白控制字符不能绕过表单校验：%j", async (control) => {
+    const invalidArgs = [`C:${control}folder.js`];
+    await openJson(invalidArgs);
+    await clickControl("formMode");
+
+    expect(document.querySelector<HTMLInputElement>("#cy-mcp-args")?.value).toBe(JSON.stringify(invalidArgs));
     await clickControl("confirm");
     expect(document.querySelector('[role="alert"]')?.textContent).toContain("settingsPage.mcp.argsInvalid");
     expect(addMcpServer).not.toHaveBeenCalled();
-
-    await setText("cy-mcp-args", JSON.stringify(["hello world", ""]));
-    await clickControl("confirm");
-    expectSubmittedArgs(["hello world", ""]);
   });
 });
