@@ -103,12 +103,22 @@ export class NeteaseOpenapiProvider implements MusicProvider {
         throw new MusicInputError("E_PLAYLIST_LOAD_INCOMPLETE", "E_PLAYLIST_LOAD_INCOMPLETE: invalid songs response");
       }
       if (records.length === 0) return songs;
-      // 端点忽略 offset 时明确失败，避免把重复页作为完整队列返回。
-      const signature = JSON.stringify(records.map((record) => record?.id));
-      if (seenPages.has(signature)) {
-        throw new MusicInputError("E_PLAYLIST_LOAD_INCOMPLETE", "E_PLAYLIST_LOAD_INCOMPLETE: repeated page");
+      // 缺少加密 ID 的条目仍参与分页，使用原始 ID 辅助辨认重复页。
+      const identities = records.map((record) => {
+        if (typeof record?.id === "string" && record.id.trim()) return ["id", record.id];
+        if (Number.isSafeInteger(record?.originalId) && record.originalId > 0) {
+          return ["originalId", record.originalId];
+        }
+        return null;
+      });
+      // 无可靠身份的条目不能作为重复证据；此时仍由总页数上限兜底。
+      if (identities.every((identity) => identity !== null)) {
+        const signature = JSON.stringify(identities);
+        if (seenPages.has(signature)) {
+          throw new MusicInputError("E_PLAYLIST_LOAD_INCOMPLETE", "E_PLAYLIST_LOAD_INCOMPLETE: repeated page");
+        }
+        seenPages.add(signature);
       }
-      seenPages.add(signature);
       songs.push(...records);
       // 用包含不可播放歌曲的原始条目推进分页，全部加载后再过滤。
       if (records.length < PLAYLIST_PAGE_SIZE) return songs;

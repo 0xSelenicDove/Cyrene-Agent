@@ -198,6 +198,38 @@ describe("playlist song pagination", () => {
     expect(client.getPlaylistSongs.mock.calls.map((args) => args[2])).toEqual([0, 30, 60]);
   });
 
+  it.each(["", undefined])("loads later valid songs after two full pages with missing encrypted IDs (%s)", async (id) => {
+    const records = songs(61).map((song, i) => ({ ...song, originalId: i + 1, id: i < 60 ? id : song.id }));
+    const { client, dispatch, provider } = setup([]);
+    client.getPlaylistSongs.mockImplementation((_id, limit, offset) => Promise.resolve(records.slice(offset, offset + limit)));
+    const detail = await provider.getPlaylistDetail("playlist");
+    expect(detail.tracks.map((track) => track.id)).toEqual([records[60].id]);
+    expect(client.getPlaylistSongs.mock.calls.map((args) => args[2])).toEqual([0, 30, 60]);
+    await provider.playPlaylist("playlist");
+    expect(dispatch).toHaveBeenCalledWith({ kind: "playlist", playUrl: "https://example.test/song.mp3", tracks: detail.tracks });
+  });
+
+  it("does not treat pages without reliable identities as proof of a repeated page", async () => {
+    const records = songs(61).map((song, i) => i < 60 ? { ...song, id: "", originalId: 0 } : song);
+    const { client, provider } = setup(records);
+    expect((await provider.getPlaylistDetail("playlist")).tracks).toHaveLength(1);
+    expect(client.getPlaylistSongs.mock.calls.map((args) => args[2])).toEqual([0, 30, 60]);
+  });
+
+  it("still rejects repeated pages identified by original IDs", async () => {
+    const { client, provider } = setup([]);
+    client.getPlaylistSongs.mockResolvedValue(songs(30).map((song, i) => ({ ...song, id: "", originalId: i + 1 })));
+    await expect(provider.getPlaylistDetail("playlist")).rejects.toThrow("repeated page");
+    expect(client.getPlaylistSongs).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds pages without reliable identities when the endpoint never terminates", async () => {
+    const { client, provider } = setup([]);
+    client.getPlaylistSongs.mockResolvedValue(songs(30).map((song) => ({ ...song, id: "", originalId: 0 })));
+    await expect(provider.getPlaylistDetail("playlist")).rejects.toThrow("pagination limit reached");
+    expect(client.getPlaylistSongs).toHaveBeenCalledTimes(1000);
+  });
+
   it.each([undefined, 0, 1, 999])("does not trust stale playlist trackCount %s as a pagination boundary", async (trackCount) => {
     const { client, provider } = setup(songs(61));
     client.getPlaylistDetail.mockResolvedValue({ id: "playlist", trackCount });
