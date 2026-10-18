@@ -1,6 +1,6 @@
 # 贡献者
 
-感谢所有通过 GitHub 为项目做出贡献的开发者！
+感谢所有通过 GitHub 为Cyrene做出贡献的开发者！
 
 ## 代码贡献
 
@@ -76,11 +76,70 @@
 - 问答卡增加“暂不回答”入口、中英日文案和推荐选项提示，补充交互及提交链路测试（[#208](https://github.com/Playa-Cyrene/Cyrene-Agent/pull/208)）。
 - 修复已打开 Markdown 预览时的行号跳转与重复定位（[#217](https://github.com/Playa-Cyrene/Cyrene-Agent/pull/217)）。
 
+## Issue 贡献
+
+列表按各作者**首次提交 Issue 的时间**排序，仅记录用户名与对应 Issue 链接，不展开具体问题内容。GitHub 上共 104 条 Issue（含已关闭与仍开启），其中维护者本人提交的 6 条不计入；部分作者同时有代码贡献，已在上文「代码贡献」中列出。本次核对截至 2026-10-18，共 41 位外部反馈者。
+
+- [@genghaosan](https://github.com/genghaosan)：[#1](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/1) [#2](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/2) [#4](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/4)
+- [@yaxuan97](https://github.com/yaxuan97)：[#3](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/3) [#41](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/41) [#70](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/70)
+- 高远（[@GaoYuan522](https://github.com/GaoYuan522)）：[#6](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/6) [#11](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/11) [#18](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/18) [#20](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/20) [#21](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/21)
+- GimmeX（[@GimmeCyy](https://github.com/GimmeCyy)）：[#8](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/8)
+- 没雷石东呢（[@MainRedstoner](https://github.com/MainRedstoner)）：[#9](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/9) [#12](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/12)
+- [@Coriodu](https://github.com/Coriodu)：[#15](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/15) [#16](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/16)
+- Gali_bailan（[@badtoliethalo](https://github.com/badtoliethalo)）：[#22](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/22)
+- [@System1145141](https://github.com/System1145141)：[#19](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/19)
+- Firefly♡Trailblazer（[@RickyYang0325](https://github.com/RickyYang0325)）：[#17](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/17)
+- [@bephbin35](https://github.com/bephbin35)：[#23](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/23)
+- Tianzzi（[@Unknownuserfrommars](https://github.com/Unknownuserfrommars)）：[#25](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/25) [#27](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/27) [#85](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/85) [#92](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/92) [#94](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/94) [#186](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/186) [#209](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/209) [#212](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/212)
+- 雨行雨中（[@yuxingyuzhong](https://github.com/yuxingyuzhong)）：[#29](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/29) [#30](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/30) [#78](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/78)
+- [@ZMKFZJ](https://github.com/ZMKFZJ)：[#34](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/34)
+- [@harunaahmadwada-sudo](https://github.com/harunaahmadwada-sudo)：[#35](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/35)
+- [@Tobi1chi](https://github.com/Tobi1chi)：[#39](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/39)
+- Zehao Liang（[@LZhWi](https://github.com/LZhWi)）：[#58](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/58) [#191](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/191) [#199](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/199) [#215](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/215) [#218](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/218) [#222](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/222) [#226](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/226)
+- 梨衣、（[@liyi3068238601-oss](https://github.com/liyi3068238601-oss)）：[#60](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/60) [#96](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/96) [#97](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/97)
+- [@lucifergzsz414](https://github.com/lucifergzsz414)：[#61](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/61)
+- [@Lambunge520](https://github.com/Lambunge520)：[#63](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/63) [#66](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/66) [#71](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/71) [#77](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/77) [#80](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/80) [#81](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/81) [#90](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/90)
+- [@modusensus](https://github.com/modusensus)：[#72](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/72)
+- wuuuuu（[@lang338](https://github.com/lang338)）：[#82](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/82) [#88](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/88) [#101](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/101) [#184](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/184)
+- Fid落花（[@Fid-falling](https://github.com/Fid-falling)）：[#87](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/87)
+- [@ahwhshen](https://github.com/ahwhshen)：[#98](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/98) [#118](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/118) [#153](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/153) [#169](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/169) [#177](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/177) [#181](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/181)
+- [@Downfallofthedownfall](https://github.com/Downfallofthedownfall)：[#134](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/134)
+- Liu Zhixing（[@samas3](https://github.com/samas3)）：[#135](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/135)
+- 雩风（[@shenDyufeng](https://github.com/shenDyufeng)）：[#136](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/136)
+- 被win11吃掉的磁贴（[@citie114514](https://github.com/citie114514)）：[#146](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/146) [#147](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/147) [#148](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/148) [#149](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/149) [#150](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/150) [#151](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/151)
+- [@Cyrene-xl](https://github.com/Cyrene-xl)：[#137](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/137)
+- [@1971687396](https://github.com/1971687396)：[#157](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/157) [#158](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/158) [#159](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/159) [#160](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/160) [#161](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/161) [#162](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/162) [#163](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/163) [#167](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/167)
+- Starripple（[@starripple-lian](https://github.com/starripple-lian)）：[#154](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/154) [#164](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/164) [#165](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/165)
+- [@ttttxzzzz](https://github.com/ttttxzzzz)：[#166](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/166)
+- Jeffery Cai（[@superme535](https://github.com/superme535)）：[#172](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/172)
+- tiansy（[@scclovez](https://github.com/scclovez)）：[#171](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/171)
+- [@cjw-1007](https://github.com/cjw-1007)：[#175](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/175)
+- Tianming Bi（[@TianmingBi](https://github.com/TianmingBi)）：[#173](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/173)
+- done（[@berhbro](https://github.com/berhbro)）：[#180](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/180)
+- 忆过往昔不得（[@Elysia0927](https://github.com/Elysia0927)）：[#182](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/182)
+- [@a8068578-boop](https://github.com/a8068578-boop)：[#185](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/185)
+- [@xiaolin-create](https://github.com/xiaolin-create)：[#187](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/187)
+- [@GameLef](https://github.com/GameLef)：[#190](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/190)
+- Ying Fang（[@ActorF](https://github.com/ActorF)）：[#194](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/194) [#216](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/216) [#223](https://github.com/Playa-Cyrene/Cyrene-Agent/issues/223)
+
+## 插件仓库贡献
+
+列表按各作者**首次合入 PR 的时间**排序，仅记录用户名与对应 PR 链接，不展开具体内容。仅统计已合入的 PR，关闭未合入与仍开启的 PR 不计入；维护者本人提交的记录不计入。本次核对截至 2026-10-18，范围为 [Cyrene-Plugins](https://github.com/Playa-Cyrene/Cyrene-Plugins)，共 21 个已合入 PR，其中外部贡献 20 个，来自 8 位作者。
+
+- [@1971687396](https://github.com/1971687396)：[#4](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/4) [#5](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/5) [#7](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/7) [#14](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/14) [#15](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/15)
+- [@Downfallofthedownfall](https://github.com/Downfallofthedownfall)：[#3](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/3) [#10](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/10)
+- [@modusensus](https://github.com/modusensus)：[#6](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/6)
+- chuxuan（[@boring9720](https://github.com/boring9720)）：[#2](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/2) [#8](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/8)
+- Tianzzi（[@Unknownuserfrommars](https://github.com/Unknownuserfrommars)）：[#9](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/9) [#11](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/11) [#22](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/22)
+- [@ahwhshen](https://github.com/ahwhshen)：[#12](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/12) [#13](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/13) [#23](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/23) [#24](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/24)
+- 被win11吃掉的磁贴（[@citie114514](https://github.com/citie114514)）：[#19](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/19) [#20](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/20)
+- Zehao Liang（[@LZhWi](https://github.com/LZhWi)）：[#25](https://github.com/Playa-Cyrene/Cyrene-Plugins/pull/25)
+
 ---
 
 ## 特别鸣谢
 
-- **是依七哒** — 制作并分享 Live2D 模型相关资源，为桌宠展示提供了重要参考与支持。
+- [是依七哒](https://space.bilibili.com/457683484)— 制作并分享 Live2D 模型相关资源，为桌宠展示提供了重要参考与支持。
 
 ---
 
