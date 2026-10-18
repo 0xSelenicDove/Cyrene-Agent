@@ -454,7 +454,7 @@ MIT 仅约束本仓库的源代码，不适用于角色、Live2D 模型与美术
   详见 [MODEL_LICENSE.md](./MODEL_LICENSE.md)
 - **Live2D Cubism SDK**：© Live2D Cubism
 - **界面与 README 图标**：[Lucide](https://lucide.dev)（ISC License）
-- **组织成员与维护者**：详见 [docs/MAINTAINERS.md](./docs/MAINTAINERS.md)
+- **组织成员与感谢信**：谁在维护这个项目，以及作者写给社区的一封长信 —— 详见 [docs/MAINTAINERS.md](./docs/MAINTAINERS.md)
 - **贡献者名单**：详见 [docs/CONTRIBUTORS.md](./docs/CONTRIBUTORS.md)
 
 <!-- 贡献者头像列表由 .github/workflows/contributors.yml 自动维护，请勿手动修改这对标记之间的内容 -->
