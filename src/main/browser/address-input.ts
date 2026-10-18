@@ -85,8 +85,13 @@ function classifyHost(hostname: string, rawAuthority: string): HostKind {
   if (host === "localhost") return "local";
   const labels = host.split(".");
   if (labels.length < 2 || !labels.every((label) => DOMAIN_LABEL.test(label))) return null;
+  // 单独的保留后缀（含两段的 `home.arpa`）只是后缀本身，不是某台机器
+  if (LOCAL_SUFFIXES.includes(host)) return null;
   if (LOCAL_SUFFIXES.some((suffix) => host.endsWith(`.${suffix}`))) return "local";
-  return TLD.test(labels[labels.length - 1]) ? "public" : null;
+  const tld = labels[labels.length - 1];
+  // .arpa 是基础设施域（反向解析等），除上面的 home.arpa 外没有网站，不按公网补 https
+  if (tld === "arpa") return null;
+  return TLD.test(tld) ? "public" : null;
 }
 
 function readCanonicalIpv4(host: string): number[] | null {

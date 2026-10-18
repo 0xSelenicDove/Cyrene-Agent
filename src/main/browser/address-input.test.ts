@@ -135,6 +135,13 @@ const UNCHANGED: Unchanged[] = [
   ["lan", "invalid_url"],
   ["invalid", "invalid_url"],
   ["test:3000", "invalid_url"],
+  ["home.arpa", "invalid_url"],
+  ["home.arpa:8080", "invalid_url"],
+  ["home.arpa.", "invalid_url"],
+  ["HOME.ARPA", "invalid_url"],
+  // .arpa 基础设施域不当作网站
+  ["1.0.168.192.in-addr.arpa", "invalid_url"],
+  ["example.arpa", "invalid_url"],
   // UNC 共享路径与以斜杠开头的路径不是网址
   ["\\\\example.com\\share", "invalid_url"],
   ["\\\\10.0.0.5\\share", "invalid_url"],
