@@ -17,7 +17,7 @@ interface McpFormState {
   name: string;
   transport: McpTransport;
   command: string;   // stdio：启动命令
-  args: string;      // stdio：参数（空格分隔）
+  args: string;      // stdio：参数（空格分隔或 JSON 字符串数组）
   url: string;       // 远程：服务地址
   env: string;       // stdio：环境变量 JSON 文本
   headers: string;   // 远程：请求头 JSON 文本
@@ -27,8 +27,27 @@ const MCP_FORM_DEFAULTS: McpFormState = {
   name: "", transport: "stdio", command: "", args: "", url: "", env: "", headers: "",
 };
 
+class McpArgsError extends Error {}
+
 function splitArgs(text: string): string[] {
-  return text.trim().split(/\s+/).filter(Boolean);
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("[")) return trimmed.split(/\s+/).filter(Boolean);
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed) && parsed.every((arg) => typeof arg === "string")) return parsed;
+  } catch {
+    // 参数数组写错时不能退回空格拆分，否则会把损坏的参数传给进程。
+  }
+  throw new McpArgsError("Expected a JSON array of strings");
+}
+
+function formatArgs(args: unknown[]): string {
+  const values = args.map(String);
+  const plain = values.join(" ");
+  // 含空白、空参数或以 [ 开头时，用 JSON 保留 argv 边界及 Windows 路径。
+  return plain.startsWith("[") || values.some((arg) => arg === "" || /\s/.test(arg))
+    ? JSON.stringify(values)
+    : plain;
 }
 
 /** 解析 JSON 对象文本（环境变量/请求头）。空文本返回空对象；格式错误抛异常。 */
@@ -89,7 +108,7 @@ export function entryToConfig(name: string, entry: Record<string, unknown>, exis
   const config: McpServerConfigView = { id: deriveServerId(name, existingIds), name, transport };
   if (transport === "stdio") {
     if (typeof entry.command === "string" && entry.command.trim()) config.command = entry.command.trim();
-    if (Array.isArray(entry.args)) config.args = entry.args.map((v) => String(v)).filter(Boolean);
+    if (Array.isArray(entry.args)) config.args = entry.args.map((v) => String(v));
     const env = toOptionalRecord(entry.env);
     if (env) config.env = env;
   } else {
@@ -113,7 +132,7 @@ export function parseJsonServers(text: string): Array<{ name: string; entry: Rec
     .map(([name, value]) => ({ name, entry: value as Record<string, unknown> }));
 }
 
-/** 表单状态 → JSON 条目（用于表单→JSON 模式同步）。环境变量/请求头格式有误时抛异常。 */
+/** 表单状态 → JSON 条目（用于表单→JSON 模式同步）。参数/环境变量/请求头格式有误时抛异常。 */
 export function formToEntry(form: McpFormState): Record<string, unknown> {
   const entry: Record<string, unknown> = {};
   if (form.transport === "stdio") {
@@ -137,7 +156,7 @@ export function entryToFormPatch(name: string, entry: Record<string, unknown>): 
   const patch: Partial<McpFormState> = { name, transport };
   if (transport === "stdio") {
     patch.command = typeof entry.command === "string" ? entry.command : "";
-    patch.args = Array.isArray(entry.args) ? entry.args.map(String).join(" ") : "";
+    patch.args = Array.isArray(entry.args) ? formatArgs(entry.args) : "";
     patch.env = toOptionalRecord(entry.env) ? JSON.stringify(entry.env, null, 2) : "";
   } else {
     patch.url = typeof entry.url === "string" ? entry.url : "";
@@ -189,7 +208,11 @@ function AddMcpServerModal({ open, initialForm, existingIds, onClose, onAdded }:
         try {
           const draft = { mcpServers: { [form.name.trim() || "server-name"]: formToEntry(form) } };
           setJsonText(JSON.stringify(draft, null, 2));
-        } catch {
+        } catch (error) {
+          if (error instanceof McpArgsError) {
+            setError(t("settingsPage.mcp.argsInvalid"));
+            return;
+          }
           // 环境变量/请求头 JSON 格式有误时保留原文本，由 JSON 模式自行提示
         }
       }
@@ -268,7 +291,9 @@ function AddMcpServerModal({ open, initialForm, existingIds, onClose, onAdded }:
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof McpArgsError
+        ? t("settingsPage.mcp.argsInvalid")
+        : err instanceof Error ? err.message : String(err));
       return;
     }
 

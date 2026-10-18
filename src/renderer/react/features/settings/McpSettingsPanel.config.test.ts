@@ -175,6 +175,28 @@ describe("表单 ↔ JSON 条目双向同步", () => {
     expect(JSON.parse(patch.env ?? "{}")).toEqual({ K: "v" });
   });
 
+  it.each([
+    ["C:\\My Folder\\server.js", "--label", "hello world"],
+    ["", " ", "\t", "first\nsecond"],
+    ['say "hello"', "C:\\folder\\", "a\\b", "'quoted'"],
+    ["[value]", "--flag"],
+    ["[", "--flag"],
+  ])("JSON 参数经表单往返保留每项原值：%j", (...args: string[]) => {
+    const entry = { command: "node", args };
+    const patch = entryToFormPatch("demo", entry);
+    expect(formToEntry({ ...makeForm({}), ...patch })).toEqual(entry);
+  });
+
+  it("表单支持 JSON 字符串数组，空数组不生成参数", () => {
+    expect(formToEntry(makeForm({ command: "node", args: '["hello world", ""]' })))
+      .toEqual({ command: "node", args: ["hello world", ""] });
+    expect(formToEntry(makeForm({ command: "node", args: "[]" }))).toEqual({ command: "node" });
+  });
+
+  it.each(['["unfinished"', '["valid", 1]', '[null]', '[["nested"]]'])("拒绝损坏或非字符串的参数数组：%s", (args) => {
+    expect(() => formToEntry(makeForm({ command: "node", args }))).toThrow();
+  });
+
   it("http 往返：url 和 headers 恢复", () => {
     const entry = formToEntry(makeForm({
       transport: "http", url: "https://mcp.example.com/mcp", headers: '{"Authorization": "Bearer t"}',
@@ -186,6 +208,10 @@ describe("表单 ↔ JSON 条目双向同步", () => {
 });
 
 describe("entryToConfig（后端配置组装）", () => {
+  it("保留空字符串参数的位置", () => {
+    const args = ["", "--label", "", "hello world"];
+    expect(entryToConfig("demo", { command: "node", args }, []).args).toEqual(args);
+  });
   it("stdio 条目透传 command/args/env 并生成 id", () => {
     const config = entryToConfig("weather", { command: "npx", args: ["-y", "p"], env: { K: "v" } }, []);
     expect(config).toEqual({
