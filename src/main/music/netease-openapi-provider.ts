@@ -4,7 +4,7 @@
 // Playback: resolves the real audio URL, then delegates to an injected
 // dispatcher (MpvController lands in M3). Without a dispatcher the provider
 // reports `client_unavailable` instead of failing the whole tool call.
-import type { NeteaseOpenapiClient } from "./netease-openapi-client";
+import type { NeteaseOpenapiClient, OpenapiSongRecord } from "./netease-openapi-client";
 import type { MusicProvider } from "./music-provider";
 import type { PlaybackDispatchResult, MusicTrack, MusicPlaylist, MusicPlaylistDetail, MusicSubscription } from "./types";
 import { MusicInputError } from "./types";
@@ -22,6 +22,10 @@ import {
 export type PlaybackDispatcher = (
   resource: { kind: "song"; playUrl: string; track: MusicTrack } | { kind: "playlist"; playUrl: string; tracks: MusicTrack[] },
 ) => Promise<PlaybackDispatchResult>;
+
+const PLAYLIST_PAGE_SIZE = 30;
+// 防止异常端点始终返回整页而无限请求；达到上限时报错，不静默截断。
+const MAX_PLAYLIST_PAGES = 1000;
 
 export class NeteaseOpenapiProvider implements MusicProvider {
   readonly id = "netease-openapi";
@@ -60,8 +64,8 @@ export class NeteaseOpenapiProvider implements MusicProvider {
   }
 
   async playPlaylist(playlistId: string): Promise<PlaybackDispatchResult> {
-    const songs = await this.client.getPlaylistSongs(playlistId, 30, 0);
-    const tracks = normalizeSongRecords(songs);
+    const songs = await this.getAllPlaylistSongs(playlistId);
+    const tracks = normalizeSongRecords(songs, songs.length);
     if (tracks.length === 0) throw new MusicInputError("E_PLAYLIST_EMPTY", `E_PLAYLIST_EMPTY: ${playlistId}`);
     if (!this.dispatch) {
       return { state: "client_unavailable", resourceType: "playlist", resourceId: playlistId, errorCode: "E_PLAYBACK_DISPATCHER_MISSING" };
@@ -85,9 +89,31 @@ export class NeteaseOpenapiProvider implements MusicProvider {
   async getPlaylistDetail(playlistId: string): Promise<MusicPlaylistDetail> {
     const [detail, songs] = await Promise.all([
       this.client.getPlaylistDetail(playlistId),
-      this.client.getPlaylistSongs(playlistId, 30, 0),
+      this.getAllPlaylistSongs(playlistId),
     ]);
     return normalizePlaylistDetail(detail, songs);
+  }
+
+  private async getAllPlaylistSongs(playlistId: string): Promise<OpenapiSongRecord[]> {
+    const songs: OpenapiSongRecord[] = [];
+    const seenPages = new Set<string>();
+    for (let page = 0; page < MAX_PLAYLIST_PAGES; page++) {
+      const records = await this.client.getPlaylistSongs(playlistId, PLAYLIST_PAGE_SIZE, songs.length);
+      if (!Array.isArray(records)) {
+        throw new MusicInputError("E_PLAYLIST_LOAD_INCOMPLETE", "E_PLAYLIST_LOAD_INCOMPLETE: invalid songs response");
+      }
+      if (records.length === 0) return songs;
+      // 端点忽略 offset 时明确失败，避免把重复页作为完整队列返回。
+      const signature = JSON.stringify(records.map((record) => record?.id));
+      if (seenPages.has(signature)) {
+        throw new MusicInputError("E_PLAYLIST_LOAD_INCOMPLETE", "E_PLAYLIST_LOAD_INCOMPLETE: repeated page");
+      }
+      seenPages.add(signature);
+      songs.push(...records);
+      // 用包含不可播放歌曲的原始条目推进分页，全部加载后再过滤。
+      if (records.length < PLAYLIST_PAGE_SIZE) return songs;
+    }
+    throw new MusicInputError("E_PLAYLIST_LOAD_INCOMPLETE", "E_PLAYLIST_LOAD_INCOMPLETE: pagination limit reached");
   }
 
   async createPlaylist(name: string, _privacy?: boolean): Promise<MusicPlaylist> {
