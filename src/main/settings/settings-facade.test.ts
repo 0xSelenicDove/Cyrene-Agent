@@ -15,6 +15,38 @@ vi.mock("electron", () => ({
   },
 }));
 
+describe("general window state persistence setting", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    electronMock.userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-window-state-settings-"));
+  });
+
+  it("defaults to true for fresh and legacy settings", () => {
+    expect(normalizeGeneralSettings({}).rememberWindowState).toBe(true);
+    expect(normalizeGeneralSettings({ petAlwaysOnTop: false } as never).rememberWindowState).toBe(true);
+  });
+
+  it("keeps an explicit false value", () => {
+    expect(normalizeGeneralSettings({ rememberWindowState: false }).rememberWindowState).toBe(false);
+  });
+
+  it("round trips through general-settings.json", async () => {
+    const first = await import("./settings-facade");
+    first.saveGeneralSettings({ rememberWindowState: false });
+
+    vi.resetModules();
+    const reloaded = await import("./settings-facade");
+    expect(reloaded.loadGeneralSettings().rememberWindowState).toBe(false);
+  });
+});
+
+describe("general theme choice persistence", () => {
+  it("keeps the system choice while preserving the legacy light default", () => {
+    expect(normalizeGeneralSettings({}).uiTheme).toBe("pearl-white");
+    expect(normalizeGeneralSettings({ uiTheme: "system" }).uiTheme).toBe("system");
+  });
+});
+
 describe("general LSP settings", () => {
   it("keeps valid user server overrides and safely drops malformed settings", () => {
     const settings = normalizeGeneralSettings({
@@ -42,7 +74,7 @@ describe("general Harness tool concurrency settings", () => {
   it("defaults to four and normalizes the configured safe range", () => {
     expect(normalizeGeneralSettings({}).maxParallelToolCalls).toBe(4);
     expect(normalizeGeneralSettings({ maxParallelToolCalls: 0 } as never).maxParallelToolCalls).toBe(1);
-    expect(normalizeGeneralSettings({ maxParallelToolCalls: 99 } as never).maxParallelToolCalls).toBe(8);
+    expect(normalizeGeneralSettings({ maxParallelToolCalls: 99 } as never).maxParallelToolCalls).toBe(12);
     expect(normalizeGeneralSettings({ maxParallelToolCalls: 3.8 } as never).maxParallelToolCalls).toBe(3);
     expect(normalizeGeneralSettings({ maxParallelToolCalls: "invalid" } as never).maxParallelToolCalls).toBe(4);
   });
@@ -169,5 +201,36 @@ describe("general early-read TTS split settings", () => {
       .toBe("paragraph");
     expect(normalizeGeneralSettings({ ttsEarlyReadSplitMode: "chapter" } as never).ttsEarlyReadSplitMode)
       .toBe("sentence");
+  });
+});
+
+describe("general interface language settings", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    electronMock.userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-locale-settings-"));
+  });
+
+  it("defaults to Chinese and keeps an explicit English choice", () => {
+    expect(normalizeGeneralSettings({}).language).toBe("zh-CN");
+    expect(normalizeGeneralSettings({ language: "en" } as never).language).toBe("en");
+  });
+
+  it("keeps an explicit Japanese choice", () => {
+    expect(normalizeGeneralSettings({ language: "ja-JP" } as never).language).toBe("ja-JP");
+  });
+
+  it("falls back to Chinese for languages that are not translated yet", () => {
+    expect(normalizeGeneralSettings({ language: "ja" } as never).language).toBe("zh-CN");
+    expect(normalizeGeneralSettings({ language: "ko" } as never).language).toBe("zh-CN");
+    expect(normalizeGeneralSettings({ language: "" } as never).language).toBe("zh-CN");
+  });
+
+  it.each(["en", "ja-JP"] as const)("keeps the %s choice across a simulated restart", async (language) => {
+    const first = await import("./settings-facade");
+    first.saveGeneralSettings({ language });
+
+    vi.resetModules();
+    const reloaded = await import("./settings-facade");
+    expect(reloaded.loadGeneralSettings().language).toBe(language);
   });
 });

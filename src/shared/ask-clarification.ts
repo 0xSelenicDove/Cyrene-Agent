@@ -47,13 +47,26 @@ export interface AskClarificationOutput {
 
 export interface AskClarificationCard {
   mode?: AskCardMode;
+  /** Only explicitly opted-in tools show the optional extra-context field. */
+  additionalContextEnabled?: boolean;
   intro: string;
   questions: AskQuestion[];
   deferredFields: string[];
+  /**
+   * 等待档位：缺省走询问卡的快问快答超时（userChoiceTimeout）；
+   * "plan_approval" 走审批专用超时（planApprovalTimeout）——审批是重决策，等待时长独立配置。
+   */
+  waitTimeoutTone?: "plan_approval";
+  /**
+   * 计划审批卡（mode="plan_approval"）专用：计划文件路径。
+   * 主进程侧元数据，不随 AskCardPayload 下发渲染端。
+   */
+  planPath?: string;
 }
 
 export interface AskUserAnswer {
   requestId: string;
+  additionalContext?: string;
   answers: Array<{
     field: string;
     selectedValues?: string[];
@@ -61,7 +74,7 @@ export interface AskUserAnswer {
   }>;
 }
 
-export type AskCardMode = "action_parameters" | "semantic_clarification";
+export type AskCardMode = "action_parameters" | "semantic_clarification" | "plan_approval";
 
 /** Renderer-visible Ask contract. It intentionally contains no tool binding or canonical value. */
 export interface AskCardPayload {
@@ -69,6 +82,7 @@ export interface AskCardPayload {
   runId: string;
   revision: number;
   mode: AskCardMode;
+  additionalContextEnabled?: boolean;
   intro: string;
   questions: AskQuestionView[];
 }
@@ -102,11 +116,20 @@ export type AskAnswerSubmission =
       questionId: string;
       source: "custom";
       text: string;
+    }
+  | {
+      /** 计划审批"需要修改"档：选定档位并同时附上修改意见原文 */
+      questionId: string;
+      source: "option_with_text";
+      optionId?: string;
+      optionIds?: string[];
+      text: string;
     };
 
 export interface AskCardSubmission {
   interactionId: string;
   runId: string;
   revision: number;
+  additionalContext?: string;
   answers: AskAnswerSubmission[];
 }

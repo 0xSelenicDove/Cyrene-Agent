@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ChannelAdapter } from "../main/channels/adapters/base";
+import type { PluginChannelAdapter } from "./types";
 import { createContext, PLUGIN_CLEANUP_TIMEOUT_MS, type PluginRuntime } from "./context";
 import { createPluginEventBus } from "./events";
 import { createPluginPromptRegistry } from "./prompts";
@@ -262,7 +262,7 @@ describe("createContext", () => {
     const rt = runtime();
     rt.channelManager.has = () => true;
     const ctx = createTestContext(rt, ["channels"]);
-    const adapter = { id: "wechat" } as ChannelAdapter;
+    const adapter = { id: "wechat" } as PluginChannelAdapter;
     await expect(ctx.registerChannelAdapter(adapter)).rejects.toThrow(/已被占用/);
   });
 
@@ -326,6 +326,19 @@ describe("createContext", () => {
     expect(marker).toHaveBeenCalledWith("set");
   });
 
+  it("包装 llm 服务时保留宿主提供的 runGoal", () => {
+    tmp = mkdtempSync(path.join(os.tmpdir(), "cyrene-ctx-test-"));
+    const rt = runtime();
+    const runGoal = vi.fn();
+    rt.llm = {
+      generateText: async () => "text",
+      runGoal,
+    } as unknown as NonNullable<PluginRuntime["llm"]>;
+
+    const ctx = createTestContext(rt, ["llm"]);
+    expect((ctx.deps.llm as { runGoal?: unknown } | undefined)?.runGoal).toBe(runGoal);
+  });
+
   it("dispose 返回 Promise 并等待渠道注销完成", async () => {
     tmp = mkdtempSync(path.join(os.tmpdir(), "cyrene-ctx-test-"));
     const rt = runtime();
@@ -338,7 +351,7 @@ describe("createContext", () => {
       unregisterFinished = true;
       return true;
     };
-    const adapter: ChannelAdapter = {
+    const adapter: PluginChannelAdapter = {
       id: "wechat",
       displayName: "test",
       capability: {

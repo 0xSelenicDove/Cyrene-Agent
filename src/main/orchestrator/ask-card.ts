@@ -91,6 +91,7 @@ export function publishAskCard(
     payload: {
       ...identity,
       mode: card.mode ?? "semantic_clarification",
+      ...(card.additionalContextEnabled ? { additionalContextEnabled: true } : {}),
       intro: card.intro,
       questions,
     },
@@ -106,9 +107,12 @@ export function resolveAskCardSubmission(
   if (submission.interactionId !== payload.interactionId
     || submission.runId !== payload.runId
     || submission.revision !== payload.revision
+    || (submission.additionalContext !== undefined
+      && (!payload.additionalContextEnabled || typeof submission.additionalContext !== "string"))
     || !Array.isArray(submission.answers)
     || submission.answers.length !== payload.questions.length) invalidAnswer();
 
+  const additionalContext = submission.additionalContext?.trim();
   const seen = new Set<string>();
   const answers = submission.answers.map((answer) => {
     if (!answer || seen.has(answer.questionId)) invalidAnswer();
@@ -121,6 +125,20 @@ export function resolveAskCardSubmission(
       if (!question.allowCustom || !customText) invalidAnswer();
       return { field: question.field, customText };
     }
+    // 计划审批"需要修改"：档位与意见同卡回传——选项按选项规则校验，意见按自定义输入规则校验
+    if (answer.source === "option_with_text") {
+      const customText = answer.text?.trim();
+      const optionIds = answer.optionIds ?? (answer.optionId ? [answer.optionId] : []);
+      if (!question.allowCustom || !customText || optionIds.length === 0
+        || (!question.type.startsWith("multi") && optionIds.length !== 1)) invalidAnswer();
+      const values = optionIds.map((optionId) => question.options.get(optionId));
+      if (values.some((value) => value === undefined)) invalidAnswer();
+      return {
+        field: question.field,
+        selectedValues: values as string[],
+        customText,
+      };
+    }
     if (answer.source !== "option" || "text" in answer) invalidAnswer();
     const optionIds = answer.optionIds ?? (answer.optionId ? [answer.optionId] : []);
     if (optionIds.length === 0 || (!question.type.startsWith("multi") && optionIds.length !== 1)) invalidAnswer();
@@ -131,7 +149,11 @@ export function resolveAskCardSubmission(
       ? { field: question.field, customText: canonicalValues[0] }
       : { field: question.field, selectedValues: canonicalValues };
   });
-  return { requestId: payload.interactionId, answers };
+  return {
+    requestId: payload.interactionId,
+    ...(additionalContext ? { additionalContext } : {}),
+    answers,
+  };
 }
 
 export function validateAskUserAnswer(
@@ -140,6 +162,9 @@ export function validateAskUserAnswer(
   answer: AskUserAnswer,
 ): AskUserAnswer {
   if (!answer || !Array.isArray(answer.answers)) invalidAnswer();
+  if (answer.additionalContext !== undefined
+    && (!card.additionalContextEnabled || typeof answer.additionalContext !== "string")) invalidAnswer();
+  const additionalContext = answer.additionalContext?.trim();
   const questions = new Map(card.questions.map((question) => [question.field, question]));
   const seen = new Set<string>();
   const answers = answer.answers.map((item) => {
@@ -167,5 +192,9 @@ export function validateAskUserAnswer(
     };
   });
   if (answers.length !== card.questions.length) invalidAnswer();
-  return { requestId, answers };
+  return {
+    requestId,
+    ...(additionalContext ? { additionalContext } : {}),
+    answers,
+  };
 }

@@ -9,7 +9,7 @@
  * - cyrene-harness.ts 的 runCompaction（mid-loop 压缩摘要）
  */
 
-import { getAdapterForConfig, streamChatWithSdk, resolveTransport } from "../vendors";
+import { getAdapterForConfig, streamChatWithSdk, generateChatWithAiSdk, resolveTransport } from "../vendors";
 import { recordUsage, recordRequest } from "../../token-usage-store";
 import type {
   ChatMessage,
@@ -21,6 +21,8 @@ import type {
 import type { HarnessConfig } from "./types";
 import { AGENT_COMPACTION_PROMPT } from "./compaction";
 import { isExplicitStreamUnsupported } from "../vendors/stream-support";
+import { runModelRequestWithRetry } from "../vendors/model-retry-runner";
+import type { ModelRetryStatus } from "../../../shared/model-retry";
 import {
   composePromptLayers,
   normalizeToolSpecsForCache,
@@ -56,6 +58,8 @@ export async function callLLM(
   config: HarnessConfig,
   signal?: AbortSignal,
   onReasoningDelta?: (delta: string) => void,
+  onTextDelta?: (delta: string) => void,
+  onRetryStatus?: (status: ModelRetryStatus) => void,
 ): Promise<ChatResponse> {
   const adapter = getAdapterForConfig(vendorConfig);
   const composed = composePromptLayers(promptLayers, messages);
@@ -67,12 +71,12 @@ export async function callLLM(
     stream: true,
     ...(requestMaxTokens !== undefined ? { maxTokens: requestMaxTokens } : {}),
     promptLayers: composed.metadata,
+    ...(vendorConfig.imageGeneration?.enabled ? { imageGeneration: vendorConfig.imageGeneration } : {}),
   };
   // 缓存路由 hints（Kimi prompt_cache_key 等）：此前只有 ChatLoop / 压缩摘要链路注入，
   // Harness 工具循环整条链漏发；在这里统一补上，下方流式与非流式兜底共用同一份 hints。
   const chatRequest = adapter.applyCacheHints?.(baseRequest, vendorConfig) ?? baseRequest;
 
-  let receivedStreamDelta = false;
   const recordResponseUsage = (response: ChatResponse): ChatResponse => {
     recordRequest(vendorConfig.model);
     if (!response.usage) return response;
@@ -86,39 +90,50 @@ export async function callLLM(
     );
     return response;
   };
-  try {
-    return recordResponseUsage(await streamChatWithSdk({
-      adapter,
-      request: chatRequest,
-      config: vendorConfig,
-      timeoutMs: config.totalTimeoutMs,
-      signal,
-      onDelta: (delta) => {
-        receivedStreamDelta = true;
-        if (delta.type === "reasoning_delta" && delta.delta) onReasoningDelta?.(delta.delta);
-      },
-    }));
-  } catch (error) {
-    if (receivedStreamDelta || !isExplicitStreamUnsupported(error)) throw error;
-  }
-
-  // 非流式兜底
   const fallbackRequest: ChatRequest = { ...chatRequest, stream: false };
-  const http = adapter.buildRequest(fallbackRequest, vendorConfig);
-  const response = await fetch(http.url, {
-    method: "POST",
-    headers: http.headers,
-    body: http.body,
-    signal,
+  const requestNonStreaming = (attemptSignal: AbortSignal): Promise<ChatResponse> => generateChatWithAiSdk({
+    adapter, request: fallbackRequest, config: vendorConfig, timeoutMs: config.totalTimeoutMs, signal: attemptSignal,
   });
-  if (!response.ok) {
-    // [image-send] 链路日志④：服务端拒绝时打印完整错误体（Anthropic 400 会带具体 reason）。
-    const rawBody = await response.text().catch(() => "");
-    console.error(`[image-send] LLM 请求被拒 HTTP ${response.status}:`, rawBody.slice(0, 500) || "(无响应体)");
-    const errorData = JSON.parse(rawBody || "{}") as { error?: { message?: string } };
-    throw new Error(errorData.error?.message || `模型请求失败：HTTP ${response.status}`);
-  }
-  return recordResponseUsage(adapter.parseResponse(await response.json()));
+
+  let forceNonStreaming = false;
+  const response = await runModelRequestWithRetry(async (attempt) => {
+    if (forceNonStreaming) return requestNonStreaming(attempt.signal);
+    let receivedStreamDelta = false;
+    try {
+      return await streamChatWithSdk({
+        adapter,
+        request: chatRequest,
+        config: vendorConfig,
+        timeoutMs: config.totalTimeoutMs,
+        signal: attempt.signal,
+        onStreamActivity: attempt.onStreamActivity,
+        onDelta: (delta) => {
+          receivedStreamDelta = true;
+          attempt.onStreamActivity();
+          if (delta.type === "reasoning_delta" && delta.delta) {
+            attempt.onVisibleDelta();
+            onReasoningDelta?.(delta.delta);
+          }
+          if (delta.type === "text_delta" && delta.delta) {
+            attempt.onVisibleDelta();
+            onTextDelta?.(delta.delta);
+          }
+        },
+      });
+    } catch (error) {
+      if (receivedStreamDelta || !isExplicitStreamUnsupported(error)) throw error;
+      forceNonStreaming = true;
+      return requestNonStreaming(attempt.signal);
+    }
+  }, {
+    provider: adapter.id,
+    model: vendorConfig.model,
+    maxRetries: config.modelRequestMaxRetries ?? 5,
+    idleTimeoutMs: config.modelRequestIdleTimeoutMs ?? 60_000,
+    signal,
+    onStatus: onRetryStatus,
+  });
+  return recordResponseUsage(response);
 }
 
 /** 历史摘要（用于 mid-loop compaction）。 */
@@ -128,6 +143,11 @@ export async function summarizeHistory(
   history: ChatMessage[],
   tools: ToolSpec[],
   signal?: AbortSignal,
+  retryOptions: {
+    maxRetries?: number;
+    idleTimeoutMs?: number;
+    onStatus?: (status: ModelRetryStatus) => void;
+  } = {},
 ): Promise<string> {
   const adapter = getAdapterForConfig(vendorConfig);
 
@@ -146,20 +166,16 @@ export async function summarizeHistory(
       : {}),
   };
 
-  const http = adapter.buildRequest(chatRequest, vendorConfig);
-  const response = await fetch(http.url, {
-    method: "POST",
-    headers: http.headers,
-    body: http.body,
+  return runModelRequestWithRetry(async ({ signal: attemptSignal }) => {
+    const response = await generateChatWithAiSdk({ adapter, request: chatRequest, config: vendorConfig,
+      timeoutMs: 0, signal: attemptSignal });
+    return response.text;
+  }, {
+    provider: adapter.id,
+    model: vendorConfig.model,
+    maxRetries: retryOptions.maxRetries ?? 5,
+    idleTimeoutMs: retryOptions.idleTimeoutMs ?? 60_000,
     signal,
+    onStatus: retryOptions.onStatus,
   });
-
-  if (!response.ok) {
-    const rawBody = await response.text().catch(() => "");
-    console.error(`[image-send] 摘要请求被拒 HTTP ${response.status}:`, rawBody.slice(0, 500) || "(无响应体)");
-    throw new Error(`摘要请求失败：HTTP ${response.status}`);
-  }
-
-  const result = adapter.parseResponse(await response.json());
-  return result.text;
 }

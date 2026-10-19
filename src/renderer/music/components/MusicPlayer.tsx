@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import type { MusicPlayerProps } from "../types";
+import { wheelToHorizontalScroll } from "../playlist-scroll";
 import logo from "../assets/logo.png";
 import decoBadge from "../assets/music2.png";
 import LyricsView from "./LyricsView";
@@ -39,6 +40,7 @@ const MODE_META: Record<
 
 export default function MusicPlayer({
   state,
+  playlistLoadError,
   actions,
   playlists,
   activePlaylistId,
@@ -111,7 +113,14 @@ export default function MusicPlayer({
           <img className="mp-brand-logo" src={logo} alt="logo" />
           <span className="mp-brand-name">Cyrene Music</span>
         </div>
-        <nav className="mp-playlists" aria-label="歌单选择">
+        <nav
+          className="mp-playlists"
+          aria-label="歌单选择"
+          onWheel={(event) => {
+            const next = wheelToHorizontalScroll(event.currentTarget, event.deltaX, event.deltaY);
+            if (next !== null) event.currentTarget.scrollLeft = next;
+          }}
+        >
           {playlists.map((pl) => (
             <button
               key={pl.id}
@@ -256,14 +265,14 @@ export default function MusicPlayer({
         </aside>
       </div>
 
-      {state.error && (
+      {(playlistLoadError || state.error) && (
         <div className="mp-error" role="alert">
           <AlertCircle size={14} />
-          <span>{state.error}</span>
+          <span>{playlistLoadError?.message ?? state.error}</span>
           <button
             type="button"
             className="mp-error-retry"
-            onClick={() => track && actions.playTrack(track)}
+            onClick={() => playlistLoadError ? playlistLoadError.onRetry() : track && actions.playTrack(track)}
           >
             重试
           </button>

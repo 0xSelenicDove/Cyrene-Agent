@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  MARKET_ZIP_URL_PREFIX,
+  MARKET_ZIP_URL_PREFIXES,
   createPluginMarketplaceService,
   type MarketplaceFetch,
   type PluginMarketplaceDeps,
@@ -12,7 +12,8 @@ import {
 
 const REGISTRY_URL_A = "https://example.test/registry-a.json";
 const REGISTRY_URL_B = "https://example.test/registry-b.json";
-const ZIP_URL = `${MARKET_ZIP_URL_PREFIX}demo-1.0.0.zip`;
+const ZIP_URL = `${MARKET_ZIP_URL_PREFIXES[0]}demo-1.0.0.zip`;
+const GITEE_ZIP_URL = `${MARKET_ZIP_URL_PREFIXES[1]}demo-1.0.0.zip`;
 
 let tmp = "";
 
@@ -58,7 +59,7 @@ function jsonResponse(data: unknown): Response {
 function makeDeps(overrides: Partial<PluginMarketplaceDeps> = {}): PluginMarketplaceDeps {
   return {
     registryUrls: [REGISTRY_URL_A, REGISTRY_URL_B],
-    zipUrlPrefix: MARKET_ZIP_URL_PREFIX,
+    zipUrlPrefixes: MARKET_ZIP_URL_PREFIXES,
     cacheDir: cacheDir(),
     installZip: vi.fn(async () => ({ ok: true, plugin: { id: "demo", name: "Demo", version: "1.0.0" }, overview: undefined })),
     ...overrides,
@@ -68,11 +69,13 @@ function makeDeps(overrides: Partial<PluginMarketplaceDeps> = {}): PluginMarketp
 describe("listMarket", () => {
   it("成功拉取并按下载量降序排序", async () => {
     const fetchImpl: MarketplaceFetch = async (input) => {
-      expect(input).toBe(REGISTRY_URL_A);
-      return jsonResponse(registryJson([
-        registryEntry({ id: "low", name: "Low", downloads: 1 }),
-        registryEntry({ id: "high", name: "High", downloads: 99 }),
-      ]));
+      if (input === REGISTRY_URL_A) {
+        return jsonResponse(registryJson([
+          registryEntry({ id: "low", name: "Low", downloads: 1 }),
+          registryEntry({ id: "high", name: "High", downloads: 99 }),
+        ]));
+      }
+      return jsonResponse(registryJson([registryEntry()]));
     };
     const service = createPluginMarketplaceService(makeDeps({ fetchImpl }));
     const result = await service.listMarket();
@@ -89,6 +92,33 @@ describe("listMarket", () => {
     const result = await service.listMarket();
     expect(result.ok).toBe(true);
     expect(result.plugins).toHaveLength(1);
+  });
+
+  it("返回各源实时死活：优先级最高的可用源为数据源，其余可用源 standby", async () => {
+    const fetchImpl: MarketplaceFetch = async (input) => {
+      if (input === REGISTRY_URL_A) return jsonResponse(registryJson([registryEntry()]));
+      throw new Error("github down");
+    };
+    const service = createPluginMarketplaceService(makeDeps({ fetchImpl }));
+    const result = await service.listMarket();
+    expect(result.ok).toBe(true);
+    expect(result.sources).toEqual([
+      { url: REGISTRY_URL_A, ok: true, used: true },
+      { url: REGISTRY_URL_B, ok: false, used: false },
+    ]);
+  });
+
+  it("全部源失败时 sources 仍带回全死状态", async () => {
+    const fetchImpl: MarketplaceFetch = async () => {
+      throw new Error("network down");
+    };
+    const service = createPluginMarketplaceService(makeDeps({ fetchImpl }));
+    const result = await service.listMarket();
+    expect(result.ok).toBe(false);
+    expect(result.sources).toEqual([
+      { url: REGISTRY_URL_A, ok: false, used: false },
+      { url: REGISTRY_URL_B, ok: false, used: false },
+    ]);
   });
 
   it("全部源失败时返回失败且快照被清空", async () => {
@@ -141,6 +171,40 @@ describe("listMarket", () => {
     const result = await service.listMarket();
     expect(result.ok).toBe(true);
     expect(result.plugins.map((p) => p.id)).toEqual(["ok"]);
+  });
+
+  it("zip 命中 GitHub 或 Gitee 任一前缀都通过校验", async () => {
+    const fetchImpl: MarketplaceFetch = async (input) => {
+      if (input === REGISTRY_URL_A) {
+        return jsonResponse(registryJson([
+          registryEntry({ id: "pkz-github", name: "Gh" }),
+          registryEntry({ id: "pkz-gitee", name: "Gt", zip: GITEE_ZIP_URL }),
+        ]));
+      }
+      return jsonResponse(registryJson([registryEntry()]));
+    };
+    const service = createPluginMarketplaceService(makeDeps({ fetchImpl }));
+    const result = await service.listMarket();
+    expect(result.ok).toBe(true);
+    expect(result.plugins.map((p) => p.id)).toEqual(["pkz-github", "pkz-gitee"]);
+  });
+
+  it("listMarket(preferred) 把偏好源提到探测首位并作为数据源", async () => {
+    const calls: string[] = [];
+    const fetchImpl: MarketplaceFetch = async (input) => {
+      calls.push(input);
+      return jsonResponse(registryJson([registryEntry()]));
+    };
+    const service = createPluginMarketplaceService(makeDeps({ fetchImpl }));
+    const result = await service.listMarket(REGISTRY_URL_B);
+    expect(result.ok).toBe(true);
+    // 偏好源被探测在最前
+    expect(calls[0]).toBe(REGISTRY_URL_B);
+    // 偏好源成为实际数据源，另一个可用源 standby
+    expect(result.sources).toEqual([
+      { url: REGISTRY_URL_B, ok: true, used: true },
+      { url: REGISTRY_URL_A, ok: true, used: false },
+    ]);
   });
 
   it("并发请求时只有最后一次请求的结果会落快照", async () => {

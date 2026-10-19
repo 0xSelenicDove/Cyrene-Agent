@@ -1,33 +1,27 @@
-import { app, BrowserWindow, dialog, shell } from "electron";
-import * as fs from "fs";
-import * as path from "path";
-import { randomUUID } from "crypto";
+import { app, BrowserWindow, shell } from "electron";
 import { IPC } from "../../shared/ipc-channels";
 import { createIpcScope, type IpcScope } from "../application/ipc-scope";
-import { DEFAULT_UI_FONT, isSupportedFontFileName } from "../../shared/ui-font";
 import type { GeneralSettings } from "./general-settings";
 import type { TimeoutSettings } from "../../shared/timeout-types";
 import { ensureCustomStylePrompt } from "../style-prompt";
 import type { WindowManager } from "../windows/window-manager";
 import {
   reactChatWindow,
-  sidebarWindow,
-  tasksWindow,
-  settingsWindow,
 } from "../windows/window-state";
 import type { RuntimeStateService } from "../orchestrator/runtime-state-service";
-import type { EmbeddingIndexService } from "../services/embedding/embedding-index-service";
-import { initReranker, getRerankerInstallStatus } from "../rag/reranker";
+import { initReranker, getRerankerInstallStatus, resetReranker } from "../rag/reranker";
 import { switchEmbeddingModel } from "../rag";
-import { downloadEmbeddingModel, deleteEmbeddingModel } from "../embedding-manager";
-import * as os from "os";
 import { testVendorConnection } from "../orchestrator/vendors/test-connection";
+import { getAdapterForConfig } from "../orchestrator/vendors";
 import type { VendorConfig } from "../orchestrator/vendors";
 import { normalizeModelSettings, getPublicModelConfig, listSavedModelProfiles, saveModelProfile, setDefaultModelProfile, saveModelSettings } from "./model-settings";
 import type { ModelSettings } from "./model-settings";
 import { getTimeoutSettings, saveTimeoutSettings } from "../timeout-manager";
 import type { syncVolcanoSearchMcp } from "./general-settings-lifecycle";
-import type { syncPlaywrightMcp } from "../sync-mcp-builtin";
+import type { syncPlaywrightMcp, syncFilesystemMcp } from "../sync-mcp-builtin";
+import { broadcastChatsChanged } from "../chats/chats-ipc";
+import { normalizeMemoryMode, type MemoryMode } from "../memory/memory-mode";
+import { getEffectiveUiTheme, watchSystemUiTheme } from "../system-ui-theme";
 
 export interface SettingsIpcDependencies {
   get windowManager(): WindowManager | null;
@@ -38,21 +32,12 @@ export interface SettingsIpcDependencies {
   runtimeStateService: RuntimeStateService;
   proactiveLifecycle: { getProactiveChatService: () => { invalidate: () => void } | null };
   reconcileUserMemoryIndex: () => Promise<void>;
-  embeddingIndexService: EmbeddingIndexService;
+  switchMemoryMode?: (mode: MemoryMode) => Promise<void>;
   syncVolcanoSearchMcp: typeof syncVolcanoSearchMcp;
   syncPlaywrightMcp: typeof syncPlaywrightMcp;
+  syncFilesystemMcp: typeof syncFilesystemMcp;
   /** 传入共享 scope 以便退出时统一注销；缺省时使用独立 scope。 */
   ipc?: IpcScope;
-}
-
-function getUiFontsDir(): string {
-  return path.join(app.getPath("userData"), "ui-fonts");
-}
-
-function getCustomFontDisplayName(filePath: string): string {
-  return (
-    path.basename(filePath, path.extname(filePath)).replace(/[-_]+/g, " ").trim().slice(0, 80) || "自定义字体"
-  );
 }
 
 const VISION_TEST_IMAGE_BASE64 =
@@ -68,24 +53,32 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
     runtimeStateService,
     proactiveLifecycle,
     reconcileUserMemoryIndex,
-    embeddingIndexService,
+    switchMemoryMode,
     syncVolcanoSearchMcp,
     syncPlaywrightMcp,
+    syncFilesystemMcp,
   } = deps;
   // 注意：windowManager 不解构，统一用 deps.windowManager 实时读取 getter。
   // registerSettingsIpc 在模块加载阶段调用，那时 windowManager 仍为 null，
   // 解构会捕获 null 并导致后续 ?. 永远短路（设置里的打开侧边栏/日程等会失效）。
 
+  watchSystemUiTheme(
+    () => getGeneralSettings().uiTheme,
+    (theme) => deps.windowManager?.broadcast(IPC.UI_THEME_CHANGED, theme),
+  );
+
   function broadcastToAuxWindows(channel: string, payload: unknown): void {
-    for (const win of [reactChatWindow, sidebarWindow, tasksWindow, settingsWindow]) {
-      if (win && !win.isDestroyed()) {
-        win.webContents.send(channel, payload);
-      }
+    const win = reactChatWindow;
+    if (win && !win.isDestroyed()) {
+      win.webContents.send(channel, payload);
     }
   }
 
   function broadcastModelConfigChanged(settings = getModelSettings()): void {
     broadcastToAuxWindows(IPC.MODEL_CONFIG_CHANGED, getPublicModelConfig(settings));
+    // 聊天窗口不在 aux 窗口里：模型窗口容量变更后它不会自己重读会话，
+    // 环形图分母会停在旧快照上。这里顺带广播一次会话变更，触发聊天窗口重载。
+    broadcastChatsChanged();
   }
 
   function broadcastRuntimeStateChanged(): void {
@@ -128,55 +121,9 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
     saveTimeoutSettings(settings),
   );
 
-  ipc.handle(IPC.UI_THEME_GET, () => getGeneralSettings().uiTheme);
+  ipc.handle(IPC.UI_THEME_GET, () => getEffectiveUiTheme(getGeneralSettings().uiTheme));
 
   ipc.handle(IPC.UI_THEME_RADIUS_GET, () => getGeneralSettings().uiThemeRadius);
-
-  ipc.handle(IPC.UI_WINDOW_CORNER_RADIUS_GET, () => getGeneralSettings().windowCornerRadius);
-
-  ipc.handle(IPC.UI_FONT_GET, () => getGeneralSettings().uiFont);
-
-  ipc.handle(IPC.SETTINGS_PICK_UI_FONT, async () => {
-    const result = await dialog.showOpenDialog({
-      properties: ["openFile"],
-      filters: [{ name: "字体文件", extensions: ["ttf", "otf"] }],
-    });
-    return result.canceled ? null : result.filePaths[0] ?? null;
-  });
-
-  ipc.handle(IPC.SETTINGS_IMPORT_UI_FONT, (_event, sourcePath: unknown) => {
-    if (typeof sourcePath !== "string" || !sourcePath) throw new Error("未选择字体文件");
-    const extension = path.extname(sourcePath).toLowerCase();
-    if (extension !== ".ttf" && extension !== ".otf") throw new Error("仅支持 .ttf 或 .otf 字体文件");
-    const stat = fs.statSync(sourcePath);
-    if (!stat.isFile() || stat.size <= 0 || stat.size > 50 * 1024 * 1024) throw new Error("字体文件无效或超过 50 MB");
-
-    const fileName = `custom-${randomUUID()}${extension}`;
-    if (!isSupportedFontFileName(fileName)) throw new Error("字体文件名无效");
-    const fontsDir = getUiFontsDir();
-    fs.mkdirSync(fontsDir, { recursive: true });
-    const targetPath = path.join(fontsDir, fileName);
-    fs.copyFileSync(sourcePath, targetPath);
-
-    const before = getGeneralSettings().uiFont;
-    const saved = saveGeneralSettings({
-      uiFont: { kind: "custom", fileName, displayName: getCustomFontDisplayName(sourcePath) },
-    });
-    if (before.kind === "custom" && before.fileName !== fileName) {
-      const oldPath = path.join(fontsDir, before.fileName);
-      if (isSupportedFontFileName(before.fileName)) fs.rmSync(oldPath, { force: true });
-    }
-    return saved.uiFont;
-  });
-
-  ipc.handle(IPC.SETTINGS_RESET_UI_FONT, () => {
-    const before = getGeneralSettings().uiFont;
-    const saved = saveGeneralSettings({ uiFont: DEFAULT_UI_FONT });
-    if (before.kind === "custom" && isSupportedFontFileName(before.fileName)) {
-      fs.rmSync(path.join(getUiFontsDir(), before.fileName), { force: true });
-    }
-    return saved.uiFont;
-  });
 
   ipc.handle(IPC.SETTINGS_SAVE_GENERAL, (_event, settings: Partial<GeneralSettings>) => {
     const saved = saveGeneralSettings(settings);
@@ -204,6 +151,14 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
       await syncPlaywrightMcp(saved);
     }
 
+    // Filesystem MCP：按 settings 字段自动连接/断开（允许目录固定为下载文件夹）
+    if ("filesystemMcpEnabled" in tts) {
+      await syncFilesystemMcp({
+        filesystemMcpEnabled: saved.filesystemMcpEnabled,
+        allowedDir: app.getPath("downloads"),
+      });
+    }
+
     // 主动聊天总开关变化时使现有评估失效（频率档位由 ProactiveChat 内部判定，无需重启）。
     if ("proactiveChatMode" in tts) {
       proactiveLifecycle.getProactiveChatService()?.invalidate();
@@ -217,22 +172,6 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
     const filePath = ensureCustomStylePrompt();
     await shell.showItemInFolder(filePath);
     return { ok: true, filePath };
-  });
-
-  ipc.on(IPC.SETTINGS_OPEN_SIDEBAR, () => {
-    deps.windowManager?.createSidebarWindow();
-  });
-
-  ipc.on(IPC.SETTINGS_CLOSE_SIDEBAR, async () => {
-    sidebarWindow?.close();
-  });
-
-  ipc.on(IPC.SETTINGS_OPEN_TASKS, () => {
-    deps.windowManager?.createTasksWindow();
-  });
-
-  ipc.on(IPC.SETTINGS_CLOSE_TASKS, async () => {
-    tasksWindow?.close();
   });
 
   ipc.on(IPC.SETTINGS_SET_PET_ALWAYS_ON_TOP, (_event, value: boolean) => {
@@ -253,13 +192,38 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
 
   ipc.handle(IPC.RUNTIME_STATE_GET, () => runtimeStateService.getState());
 
-  ipc.handle(IPC.SETTINGS_SAVE_CONFIG, (_event, settings: Partial<ModelSettings>) => {
-    const saved = saveModelSettings(settings);
+  ipc.handle(IPC.SETTINGS_SAVE_CONFIG, async (_event, settings: Partial<ModelSettings>) => {
+    const previousMode = normalizeMemoryMode(getModelSettings().memoryMode);
+    const nextMode = normalizeMemoryMode(settings.memoryMode ?? previousMode);
+    const modeChanged = nextMode !== previousMode;
+    let saved: ModelSettings;
+    try {
+      if (modeChanged) await switchMemoryMode?.(nextMode);
+      saved = saveModelSettings({ ...settings, memoryMode: nextMode });
+    } catch (error) {
+      if (modeChanged) {
+        try {
+          await switchMemoryMode?.(previousMode);
+        } catch (rollbackError) {
+          console.error("[Settings] failed to restore memory mode after config update failure:", rollbackError);
+        }
+      }
+      throw error;
+    }
     broadcastModelConfigChanged(saved);
     return saved;
   });
 
   ipc.handle(IPC.SETTINGS_TEST_CONNECTION, async (_event, cfg: VendorConfig) => testVendorConnection(cfg));
+  ipc.handle(IPC.SETTINGS_PREVIEW_REASONING, (_event, cfg: VendorConfig) => {
+    const request = getAdapterForConfig(cfg).buildRequest({
+      model: cfg.model,
+      messages: [{ role: "user", content: "Hello" }],
+      stream: false,
+    }, cfg);
+    // 仅返回请求正文，不将认证头或 API 密钥暴露给设置页。
+    return JSON.parse(request.body) as Record<string, unknown>;
+  });
 
   /**
    * 测试视觉模型连通性。
@@ -274,7 +238,7 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
       const start = Date.now();
       console.log("[Cyrene] test vision: model=" + cfg.model + " url=" + cfg.baseUrl);
       try {
-        const { captionImage } = await import("../orchestrator/vision-captioner");
+        const { captionImage } = await import("../orchestrator/vision-captioner.js");
         const result = await captionImage(
           { base64: VISION_TEST_IMAGE_BASE64, mime: "image/png" },
           "这张图是什么颜色？用一个词回答。",
@@ -299,8 +263,6 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
         await reconcileUserMemoryIndex();
         saveModelSettings({ embeddingModel: "bgem3" });
         broadcastModelConfigChanged();
-        embeddingIndexService.invalidateStickerEmbeddingIndex();
-        embeddingIndexService.refreshStickerEmbeddingIndex("embedding-model-switch");
       }
       return result;
     } catch (err) {
@@ -313,7 +275,8 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
   ipc.handle(IPC.RERANKER_SET_MODE, async (_event, mode: "standard" | "none") => {
     const current = getModelSettings();
     saveModelSettings({ ...current, rerankerMode: mode });
-    await initReranker(mode);
+    if (normalizeMemoryMode(current.memoryMode) === "vector") await initReranker(mode);
+    else resetReranker();
     console.log("[Cyrene] reranker mode switched to", mode);
     return true;
   });
@@ -326,7 +289,9 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
   });
 
   ipc.handle(IPC.OPEN_EXTERNAL, async (_event, url: string) => {
-    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    // mailto: 用于「报告问题」里的发邮件入口，交给系统默认邮件客户端；其余协议一律拒绝
+    const allowed = url.startsWith("http://") || url.startsWith("https://") || url.startsWith("mailto:");
+    if (!allowed) {
       return { ok: false, error: "Invalid URL" };
     }
     try {
@@ -344,51 +309,5 @@ export function registerSettingsIpc(deps: SettingsIpcDependencies): void {
       runtimeSync: value === "llm" ? "llm" : value === "local" ? "local" : "off",
     });
     broadcastModelConfigChanged(preview);
-  });
-
-  ipc.handle(IPC.EMBEDDING_GET_STATUS, async () => {
-    const cacheDir = path.join(os.homedir(), ".cache", "huggingface");
-    const models = {
-      bgem3: { dir: "Xenova\\bge-m3", onnx: "onnx\\model_quantized.onnx", name: "BGE-M3" },
-    };
-    const result: Record<string, { installed: boolean; sizeBytes: number }> = {};
-    for (const [key, m] of Object.entries(models)) {
-      const onnxPath = path.join(cacheDir, m.dir, m.onnx);
-      const installed = fs.existsSync(onnxPath);
-      let sizeBytes = 0;
-      if (installed) {
-        try { sizeBytes = fs.statSync(onnxPath).size; } catch {}
-      }
-      result[key] = { installed, sizeBytes };
-    }
-    return result;
-  });
-
-  ipc.handle(IPC.EMBEDDING_DOWNLOAD, async (_event, payload: unknown) => {
-    const p = payload as { model?: string; mirror?: string };
-    const model = p.model || "bgem3";
-    const mirror = p.mirror || "official";
-    try {
-      const win = BrowserWindow.getFocusedWindow();
-      await downloadEmbeddingModel(model, mirror, (info) => {
-        win?.webContents.send(IPC.EMBEDDING_PROGRESS, info);
-      });
-      return { ok: true };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: message };
-    }
-  });
-
-  ipc.handle(IPC.EMBEDDING_DELETE, async (_event, payload: unknown) => {
-    const p = payload as { model?: string };
-    const model = p.model || "bgem3";
-    try {
-      deleteEmbeddingModel(model);
-      return { ok: true };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: message };
-    }
   });
 }

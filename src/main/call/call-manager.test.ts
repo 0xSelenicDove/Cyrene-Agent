@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { jsonResponse, responseBody } from "../orchestrator/vendors/sdk-stream/model-fixtures";
 
 const mocks = vi.hoisted(() => ({
   getAsrConfig: vi.fn(),
   createAsrStream: vi.fn(),
+  synthesizeByEngine: vi.fn(),
 }));
 
 vi.mock("electron", () => ({
@@ -18,13 +20,8 @@ vi.mock("../asr/asr-dispatcher", () => ({
   createAsrStream: mocks.createAsrStream,
 }));
 
-vi.mock("../orchestrator/vendors", () => ({
-  buildVendorUrl: () => "https://example.invalid/chat",
-  getAdapterForConfig: () => ({
-    transport: "openai",
-    buildRequest: () => ({ headers: {}, body: "{}" }),
-    parseResponse: () => ({ text: "模型回复" }),
-  }),
+vi.mock("../tts/tts-dispatcher", () => ({
+  synthesizeByEngine: mocks.synthesizeByEngine,
 }));
 
 vi.mock("../token-usage-store", () => ({
@@ -49,24 +46,28 @@ import {
 describe("call turn submission", () => {
   const sentStates: string[] = [];
   const sentErrors: string[] = [];
+  const sentAudio: Array<{ base64?: string; text?: string }> = [];
 
   beforeEach(() => {
     sentStates.length = 0;
     sentErrors.length = 0;
+    sentAudio.length = 0;
     mocks.getAsrConfig.mockReset();
     mocks.createAsrStream.mockReset();
+    mocks.synthesizeByEngine.mockReset();
     mocks.getAsrConfig.mockReturnValue({ engine: "mossland", apiKey: "test-key" });
     setCallWindow({
       isDestroyed: () => false,
       webContents: {
-        send: (_channel: string, payload: { state?: string; message?: string }) => {
+        send: (channel: string, payload: { state?: string; message?: string; base64?: string; text?: string }) => {
           if (payload.state) sentStates.push(payload.state);
           if (payload.message) sentErrors.push(payload.message);
+          if (channel === "call:tts-audio") sentAudio.push(payload);
         },
       },
     } as never);
     setCallSettings(
-      () => ({ provider: "openai", baseUrl: "", model: "test", apiKey: "" }),
+      () => ({ provider: "openai", baseUrl: "https://example.test/v1", model: "test", apiKey: "" }),
       () => ({ ttsEngine: "off" } as never),
       async () => "",
       async () => null,
@@ -113,6 +114,32 @@ describe("call turn submission", () => {
     expect(sentStates.at(-1)).toBe("LISTENING");
   });
 
+  it("sends the assistant text with synthesized audio for the React conversation bubbles", async () => {
+    let pushFinal!: (text: string) => void;
+    mocks.createAsrStream.mockImplementation((_config, _partial, onFinal) => {
+      pushFinal = onFinal;
+      return {
+        start: vi.fn(async () => undefined),
+        sendAudio: vi.fn(),
+        stop: vi.fn(async () => ""),
+      };
+    });
+    mocks.synthesizeByEngine.mockResolvedValue({ audio: Buffer.from("spoken reply") });
+    setCallSettings(
+      () => ({ provider: "openai", baseUrl: "https://example.test/v1", model: "test", apiKey: "test-key" }),
+      () => ({ ttsEngine: "minimax", ttsMinimaxKey: "key", ttsMinimaxVoiceId: "voice" } as never),
+      async () => "",
+      async () => null,
+    );
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(responseBody("openai", { text: "模型回复" }))));
+
+    startCall();
+    pushFinal("你好，昔涟。");
+    await endTurn();
+
+    expect(sentAudio).toEqual([{ base64: Buffer.from("spoken reply").toString("base64"), text: "模型回复" }]);
+  });
+
   it("returns to LISTENING when batch transcription fails", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const stop = vi.fn()
@@ -143,15 +170,12 @@ describe("call turn submission", () => {
       };
     });
     setCallSettings(
-      () => ({ provider: "openai", baseUrl: "", model: "test", apiKey: "test-key" }),
+      () => ({ provider: "openai", baseUrl: "https://example.test/v1", model: "test", apiKey: "test-key" }),
       () => ({ ttsEngine: "off" } as never),
       async () => "",
       async () => null,
     );
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    const fetchMock = vi.fn(async () => jsonResponse(responseBody("openai", { text: "模型回复" })));
     vi.stubGlobal("fetch", fetchMock);
 
     startCall();
@@ -214,7 +238,7 @@ describe("external speech input takeover", () => {
       },
     } as never);
     setCallSettings(
-      () => ({ provider: "openai", baseUrl: "", model: "test", apiKey: "test-key" }),
+      () => ({ provider: "openai", baseUrl: "https://example.test/v1", model: "test", apiKey: "test-key" }),
       () => ({ ttsEngine: "off" } as never),
       async () => "",
       async () => null,
@@ -253,10 +277,7 @@ describe("external speech input takeover", () => {
   });
 
   it("feeds external text into the agent pipeline and returns to LISTENING without builtin ASR", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    const fetchMock = vi.fn(async () => jsonResponse(responseBody("openai", { text: "模型回复" })));
     vi.stubGlobal("fetch", fetchMock);
     startCall();
     const claim = claimExternalSpeechInput();
@@ -276,10 +297,7 @@ describe("external speech input takeover", () => {
   });
 
   it("rejects a second submission while a turn is in flight", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    const fetchMock = vi.fn(async () => jsonResponse(responseBody("openai", { text: "模型回复" })));
     vi.stubGlobal("fetch", fetchMock);
     startCall();
     const claim = claimExternalSpeechInput();
@@ -312,10 +330,7 @@ describe("external speech input takeover", () => {
   });
 
   it("restores builtin ASR via the turn-recovery path when released mid-turn", async () => {
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({}), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }));
+    const fetchMock = vi.fn(async () => jsonResponse(responseBody("openai", { text: "模型回复" })));
     vi.stubGlobal("fetch", fetchMock);
     startCall();
     const claim = claimExternalSpeechInput();

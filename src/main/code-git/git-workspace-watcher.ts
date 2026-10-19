@@ -23,19 +23,22 @@ export interface GitWorkspaceWatcherDeps {
   createWatcher?: (paths: string[], options: ChokidarOptions) => WorkspaceFsWatcher;
   onWorkspaceChanged(sessionIds: readonly string[]): void;
   onError(error: unknown, workspaceRoot: string): void;
+  eventDebounceMs?: number;
   debounceMs?: number;
 }
 
 interface WatchedWorkspace {
   watcher: WorkspaceFsWatcher;
   sessionIds: Set<string>;
+  eventTimer?: ReturnType<typeof setTimeout>;
   timer?: ReturnType<typeof setTimeout>;
 }
 
 export function createGitWorkspaceWatcher(deps: GitWorkspaceWatcherDeps): GitWorkspaceWatcher {
   const watched = new Map<string, WatchedWorkspace>();
   const sessions = new Map<string, { key: string; references: number }>();
-  const debounceMs = deps.debounceMs ?? 300;
+  const eventDebounceMs = deps.eventDebounceMs ?? 150;
+  const debounceMs = deps.debounceMs ?? GIT_STATUS_DEBOUNCE_MS;
   const createWatcher = deps.createWatcher ?? createPlatformWatcher;
 
   const release = async (sessionId: string): Promise<void> => {
@@ -50,6 +53,7 @@ export function createGitWorkspaceWatcher(deps: GitWorkspaceWatcherDeps): GitWor
     if (!entry) return;
     entry.sessionIds.delete(sessionId);
     if (entry.sessionIds.size > 0) return;
+    if (entry.eventTimer) clearTimeout(entry.eventTimer);
     if (entry.timer) clearTimeout(entry.timer);
     watched.delete(subscription.key);
     await entry.watcher.close();
@@ -69,11 +73,20 @@ export function createGitWorkspaceWatcher(deps: GitWorkspaceWatcherDeps): GitWor
         const schedule = () => {
           const current = watched.get(key);
           if (!current) return;
-          if (current.timer) clearTimeout(current.timer);
-          current.timer = setTimeout(() => {
+          // 新事件立即取消已排队的刷新，不能等下一层防抖到期才取消。
+          if (current.timer) {
+            clearTimeout(current.timer);
             current.timer = undefined;
-            deps.onWorkspaceChanged([...current.sessionIds]);
-          }, debounceMs);
+          }
+          if (current.eventTimer) clearTimeout(current.eventTimer);
+          current.eventTimer = setTimeout(() => {
+            current.eventTimer = undefined;
+            if (current.timer) clearTimeout(current.timer);
+            current.timer = setTimeout(() => {
+              current.timer = undefined;
+              deps.onWorkspaceChanged([...current.sessionIds]);
+            }, debounceMs);
+          }, eventDebounceMs);
         };
         const watcher = createWatcher([
           input.workspaceRoot,
@@ -100,6 +113,7 @@ export function createGitWorkspaceWatcher(deps: GitWorkspaceWatcherDeps): GitWor
       watched.clear();
       sessions.clear();
       for (const entry of entries) {
+        if (entry.eventTimer) clearTimeout(entry.eventTimer);
         if (entry.timer) clearTimeout(entry.timer);
         await entry.watcher.close();
       }
@@ -107,21 +121,31 @@ export function createGitWorkspaceWatcher(deps: GitWorkspaceWatcherDeps): GitWor
   };
 }
 
-export function createCodeGitIgnoredPredicate({ workspaceRoot, gitDir }: { workspaceRoot: string; gitDir: string }): (candidate: string) => boolean {
-  const root = normalizePath(workspaceRoot);
-  const git = normalizePath(gitDir);
+const IGNORED_WORKSPACE_PATH = /(^|\/)(node_modules|dist|build|coverage|\.cache|\.next|\.turbo|release[\w-]*|\.worktrees|tmp)(\/|$)/;
+const GIT_STATUS_DEBOUNCE_MS = 60_000;
+
+export function createCodeGitIgnoredPredicate(
+  { workspaceRoot, gitDir }: { workspaceRoot: string; gitDir: string },
+  normalize: (value: string) => string = normalizePath,
+): (candidate: string) => boolean {
+  const root = normalize(workspaceRoot);
+  const git = normalize(gitDir);
+  const head = normalize(path.join(gitDir, "HEAD"));
+  const index = normalize(path.join(gitDir, "index"));
+  const refsPrefix = `${normalize(path.join(gitDir, "refs"))}/`;
+  const ignoredGitDirectories = ["objects", "logs", "hooks"].map((part) => normalize(path.join(gitDir, part)));
   return (candidate: string): boolean => {
-    const value = normalizePath(candidate);
-    if (value === normalizePath(path.join(gitDir, "HEAD")) || value === normalizePath(path.join(gitDir, "index")) || value.startsWith(`${normalizePath(path.join(gitDir, "refs"))}/`)) return false;
+    const value = normalize(candidate);
+    if (value === head || value === index || value.startsWith(refsPrefix)) return false;
     // .git 目录自身的事件（Windows 下其内部增删子项时父目录也会收到 change）不携带有效信息，忽略；
     // objects/logs/hooks 目录自身及内部变化都是噪音（含目录创建事件），一律忽略
     if (value === git) return true;
-    for (const part of ["objects", "logs", "hooks"]) {
-      if (value === `${git}/${part}` || value.startsWith(`${git}/${part}/`)) return true;
+    for (const directory of ignoredGitDirectories) {
+      if (value === directory || value.startsWith(`${directory}/`)) return true;
     }
     if (value.endsWith(".lock")) return true;
     const relative = value.startsWith(`${root}/`) ? value.slice(root.length + 1) : value;
-    return /(^|\/)(node_modules|dist|build|coverage|\.cache|\.next|\.turbo|release[\w-]*|\.worktrees|tmp)(\/|$)/.test(relative);
+    return IGNORED_WORKSPACE_PATH.test(relative);
   };
 }
 
@@ -146,6 +170,7 @@ function createNativeRecursiveWatcher(paths: string[], options: ChokidarOptions)
   const ignored = typeof options.ignored === "function" ? (options.ignored as (candidate: string) => boolean) : undefined;
   const listeners = new Map<string, Set<(value?: unknown) => void>>();
   const handles: fs.FSWatcher[] = [];
+  const refsRoot = normalizePath(paths[3]);
 
   const emit = (event: string, value?: unknown): void => {
     for (const listener of listeners.get(event) ?? []) listener(value);
@@ -158,6 +183,15 @@ function createNativeRecursiveWatcher(paths: string[], options: ChokidarOptions)
         return;
       }
       const candidate = path.resolve(watchRoot, filename);
+      if (process.platform === "win32" && _eventType === "change" && normalizePath(candidate) === refsRoot) {
+        // Windows 会单独报告 refs 目录元数据变化；只丢弃仍存在的普通目录，
+        // rename、删除后路径不存在、符号链接及无法读取状态时仍保守通知。
+        try {
+          if (fs.lstatSync(candidate, { throwIfNoEntry: false })?.isDirectory()) return;
+        } catch {
+          // 状态读取失败不能吞掉可能的真实 ref 变更。
+        }
+      }
       if (ignored?.(candidate)) return;
       emit("change", candidate);
     });

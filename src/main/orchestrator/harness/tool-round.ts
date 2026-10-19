@@ -2,9 +2,10 @@
  * Harness 工具执行轮
  *
  * 职责：模型发起 tool call 后的一轮执行——
- * - ask_user / confirm_uncertain_effect 排他为先：交互工具与普通工具互斥，一次只优先处理首个询问，
- *   其余调用一律返回 not_executed，交还给模型基于答案重新决策（confirm_uncertain_effect 是 v3 新增的
- *   未知副作用解除点，排他语义与 ask_user 一致）
+ * - ask_user / confirm_uncertain_effect / submit_plan 排他为先：交互工具与普通工具互斥，
+ *   一次只优先处理首个询问，其余调用一律返回 not_executed，交还给模型基于答案重新决策
+ *   （confirm_uncertain_effect 是 v3 新增的未知副作用解除点；submit_plan 是计划交卷审批等待，
+ *   排他语义与 ask_user 一致）
  * - 普通工具调度、执行、重试与按序提交：安全读操作可滚动并行，独占调用前后形成串行屏障，
  *   模型可见结果始终按原始 tool-call 顺序写回（并行执行是有意的演化）
  * - uncertainEffects 记录与 fatal / unknown 中断：结果不确定的非幂等副作用要显式入账并停止本轮后续执行，
@@ -16,12 +17,18 @@
 
 import type { ChatMessage, ToolCall } from "../vendors/types";
 import type { ToolCallResult } from "../types";
-import type { HarnessToolFinishedEvent, ToolObservation } from "./types";
+import { TranscriptWriteError } from "../transcript-sink";
+import type { HarnessToolFinishedEvent, SideEffectKind, ToolCallOutcome, ToolObservation } from "./types";
 import type { ToolRiskLevel } from "../../permission-policy";
 import { parseToolCallArgs, toolCallFingerprint } from "./types";
-import { dispatchToolCall, persistToolDispatchResult, type ToolDispatchResult } from "./tool-dispatcher";
-import { classifyToolExecutionMode, scheduleToolCalls, type ToolCallScheduleResult, type ToolScheduleCommitDecision } from "./tool-call-scheduler";
-import { resolveSideEffect } from "./side-effect-resolver";
+import {
+  dispatchToolCall,
+  persistToolDispatchResult,
+  resolveToolDispatchSideEffect,
+  type ToolDispatchResult,
+} from "./tool-dispatcher";
+import { classifyToolExecutionMode, scheduleToolCalls, type ToolCallScheduleResult, type ToolExecutionMode, type ToolScheduleCommitDecision } from "./tool-call-scheduler";
+import { TASK_TOOL_ID } from "./builtin-tools";
 import { extractFileChangesFromOutput } from "../tools/registry/tool-evidence";
 import { classifyToolResultError } from "./error-classifier";
 import { decideRetry, getRetryParams, sleepWithJitter } from "./retry-policy";
@@ -34,7 +41,7 @@ export type ToolRoundOutcome = "completed" | "cancelled";
 
 /** 从工具注册表读取工具注册时声明的风险级；未注册（如 harness 内置工具）视为 safe。 */
 function toolRiskOf(run: HarnessRun, toolId: string): ToolRiskLevel {
-  return run.input.tools.find((t) => t.id === toolId)?.risk ?? "safe";
+  return run.currentTools.find((t) => t.id === toolId)?.risk ?? "safe";
 }
 
 /** 发布工具完成观察事件：只读稳定元数据，未注入回调时零开销。 */
@@ -64,14 +71,39 @@ function notifyToolFinished(
  */
 export async function runToolRound(run: HarnessRun, toolCalls: ToolCall[]): Promise<ToolRoundOutcome> {
   const { input } = run;
+  // 交互工具（ask_user / confirm_uncertain_effect / submit_plan）与普通工具互斥：
+  // submit_plan 审批等待与询问等待同机制（排他轮 + userWait 不计执行超时）
   const exclusiveToolNames = input.includeInteractiveTools === false
     ? new Set<string>()
-    : new Set(["ask_user", "confirm_uncertain_effect"]);
+    : new Set(["ask_user", "confirm_uncertain_effect", "submit_plan"]);
   const askCalls = toolCalls.filter((c) => exclusiveToolNames.has(c.name));
   const otherCalls = toolCalls.filter((c) => !exclusiveToolNames.has(c.name));
 
+  // 同一批只读委派若选中同一角色，只并行第一个；后续调用作为独占任务排队，避免角色租约冲突。
+  const executionModes = new Map<string, ToolExecutionMode>();
+  const parallelTaskCompanions = new Set<string>();
+  const parallelTaskIds = new Set<string>();
+  for (const call of otherCalls) {
+    let mode = classifyToolExecutionMode(call, run.currentTools);
+    if (mode === "parallel" && call.name === TASK_TOOL_ID) {
+      const args = parseToolCallArgs(call);
+      const companionId = args.companion_id;
+      const taskId = args.task_id;
+      if (typeof companionId !== "string" || !companionId.trim() || parallelTaskCompanions.has(companionId.trim())) {
+        mode = "exclusive";
+      } else if (typeof taskId === "string" && taskId.trim() && parallelTaskIds.has(taskId.trim())) {
+        mode = "exclusive";
+      } else {
+        parallelTaskCompanions.add(companionId.trim());
+        if (typeof taskId === "string" && taskId.trim()) parallelTaskIds.add(taskId.trim());
+      }
+    }
+    executionModes.set(call.id, mode);
+  }
+
   // ── ask_user 排他分支 ──
   if (askCalls.length > 0) {
+    input.onEvent?.({ type: "candidate_text_discard", roundId: `round-${run.rounds}` });
     try {
       await runAskUserRound(run, askCalls, otherCalls);
     } catch (error) {
@@ -97,7 +129,7 @@ export async function runToolRound(run: HarnessRun, toolCalls: ToolCall[]): Prom
       calls: otherCalls,
       maxParallel: run.config.maxParallelToolCalls,
       signal: input.signal,
-      classify: (call) => classifyToolExecutionMode(call, input.tools),
+      classify: (call) => executionModes.get(call.id) ?? "exclusive",
       execute: ({ call }) => executeToolCallWithRetry(run, call),
       commit: ({ call }, result) => commitToolResult(run, call, result),
       notExecuted: async ({ call }, reason): Promise<ToolDispatchResult> =>
@@ -126,8 +158,68 @@ export async function runToolRound(run: HarnessRun, toolCalls: ToolCall[]): Prom
 }
 
 /**
+ * 当前 assistant 的轨迹条目锚点；sink 存在时工具结果提交前必须已写入。
+ */
+function requireAssistantEntryId(run: HarnessRun): string {
+  const entryId = run.currentAssistantEntryId;
+  if (!entryId) throw new Error("TRANSCRIPT_ASSISTANT_ENTRY_MISSING");
+  return entryId;
+}
+
+/**
+ * 轨迹写失败后保留不确定副作用：非幂等工具已执行但结果未能持久化，
+ * 效果状态未知，必须入账防止恢复后自动重放。
+ */
+function preserveUncertainEffectIfNeeded(run: HarnessRun, call: ToolCall, toolSideEffect?: SideEffectKind): void {
+  if (toolSideEffect !== "non_idempotent_side_effect") return;
+  const effectId = `${run.input.runId ?? run.input.toolContext?.runId ?? "unknown-run"}:${call.id}`;
+  if (run.state.uncertainEffects.some((effect) => effect.id === effectId)) return;
+  run.state.uncertainEffects.push({
+    id: effectId,
+    toolCallId: call.id,
+    fingerprint: toolCallFingerprint(call.name, parseToolCallArgs(call)),
+    toolName: call.name,
+    message: "工具已执行，但结果持久化失败，效果状态未知",
+  });
+}
+
+/**
+ * 工具结果统一提交：先内存 push，再权威轨迹落盘，最后才发布生命周期终态。
+ * committed 不得先于轨迹落盘（否则崩溃恢复看到"已提交"却无协议结果）。
+ * 轨迹写失败：非幂等副作用先入 uncertainEffects，再以 TranscriptWriteError 上抛（fail-closed）。
+ * toolSideEffect 按 registry 解析；合成 not_executed 未派发的场景走保守方向（仅双失败时出现）。
+ */
+async function commitToolResultMessage(
+  run: HarnessRun,
+  input: {
+    call: ToolCall;
+    message: ChatMessage;
+    modelMessage?: ChatMessage;
+    outcome: ToolCallOutcome;
+    fullRef?: string;
+    roundId: string;
+    toolSideEffect?: SideEffectKind;
+  },
+): Promise<void> {
+  run.messages.push(input.modelMessage ?? input.message);
+  try {
+    await run.input.transcriptSink?.appendToolResult({
+      assistantEntryId: requireAssistantEntryId(run),
+      message: input.message,
+      outcome: input.outcome,
+      ...(input.fullRef ? { fullRef: input.fullRef } : {}),
+      roundId: input.roundId,
+    });
+  } catch (error) {
+    preserveUncertainEffectIfNeeded(run, input.call, input.toolSideEffect);
+    throw new TranscriptWriteError("tool_result", error);
+  }
+}
+
+/**
  * 交互工具的排他轮：
- * 只执行首个 ask_user，其余 ask 与同轮普通工具调用统一返回 not_executed。
+ * 只执行首个交互调用（ask_user / confirm_uncertain_effect / submit_plan），
+ * 其余交互调用与同轮普通工具调用统一返回 not_executed。
  */
 async function runAskUserRound(
   run: HarnessRun,
@@ -139,33 +231,34 @@ async function runAskUserRound(
 
   // 其余 ask_user 返回 not_executed
   for (const call of askCalls.slice(1)) {
-    input.onToolLifecycle?.({ toolCallId: call.id, toolName: call.name, toolSideEffect: "read_only", status: "not_executed" });
-    notifyToolFinished(run, call, "not_executed");
-    run.messages.push(toolResultMessage(call, {
+    const message = toolResultMessage(call, {
       outcome: "not_executed",
       reason: "not_executed_due_to_another_ask",
-    }));
+    });
+    await commitToolResultMessage(run, { call, message, outcome: "not_executed", roundId: `round-${run.rounds}` });
+    input.onToolLifecycle?.({ toolCallId: call.id, toolName: call.name, toolSideEffect: "read_only", status: "not_executed" });
+    notifyToolFinished(run, call, "not_executed");
   }
 
   // 同轮普通工具调用返回 not_executed
   for (const call of otherCalls) {
+    const message = toolResultMessage(call, {
+      outcome: "not_executed",
+      reason: "not_executed_due_to_clarification",
+    });
+    await commitToolResultMessage(run, { call, message, outcome: "not_executed", roundId: `round-${run.rounds}` });
     input.onToolLifecycle?.({
       toolCallId: call.id,
       toolName: call.name,
-      toolSideEffect: resolveSideEffect(input.tools.find((tool) => tool.id === call.name), parseToolCallArgs(call)),
+      toolSideEffect: resolveToolDispatchSideEffect(call.name, parseToolCallArgs(call), run.currentTools),
       status: "not_executed",
     });
     notifyToolFinished(run, call, "not_executed");
-    run.messages.push(toolResultMessage(call, {
-      outcome: "not_executed",
-      reason: "not_executed_due_to_clarification",
-    }));
   }
 
   // 执行 ask_user（等待期间不计入执行超时）
+  // ask_user 同样走工具卡事件链：运行流里出现「询问用户」卡片，等待与问答结果可见
   run.clock.startUserWait();
-  input.onToolLifecycle?.({ toolCallId: primaryAsk.id, toolName: primaryAsk.name, toolSideEffect: "read_only", status: "started" });
-  const askStartedAt = Date.now();
   let askResult: ToolDispatchResult;
   try {
     askResult = await raceWithSignal(
@@ -177,8 +270,17 @@ async function runAskUserRound(
     throw error;
   }
   run.clock.stopUserWait();
+  const askStartedAt = run.toolCallStartedAt.get(primaryAsk.id);
 
-  run.messages.push(toolResultMessage(primaryAsk, askResult));
+  // 问答结果发布到工具卡：message 已含「问题 → 回答」逐行预览
+  input.onEvent?.({
+    type: "tool_end",
+    toolCallId: primaryAsk.id,
+    outcome: askResult.outcome === "success" ? "success" : "failure",
+    preview: askResult.message.slice(0, 200),
+  });
+  const askMessage = toolResultMessage(primaryAsk, askResult);
+  await commitToolResultMessage(run, { call: primaryAsk, message: askMessage, outcome: askResult.outcome, roundId: `round-${run.rounds}` });
   input.onToolLifecycle?.({
     toolCallId: primaryAsk.id,
     toolName: primaryAsk.name,
@@ -186,6 +288,7 @@ async function runAskUserRound(
     status: askResult.outcome === "unknown" ? "unknown" : askResult.outcome === "not_executed" ? "not_executed" : "committed",
   });
   notifyToolFinished(run, primaryAsk, askResult.outcome, askStartedAt);
+  run.toolCallStartedAt.delete(primaryAsk.id);
 }
 
 /**
@@ -207,9 +310,7 @@ async function executeToolCallWithRetry(run: HarnessRun, call: ToolCall): Promis
   }
 
   const { input } = run;
-  const toolSideEffect = resolveSideEffect(input.tools.find((tool) => tool.id === call.name), parseToolCallArgs(call));
-  input.onToolLifecycle?.({ toolCallId: call.id, toolName: call.name, toolSideEffect, status: "started" });
-  run.toolCallStartedAt.set(call.id, Date.now());
+  const toolSideEffect = resolveToolDispatchSideEffect(call.name, parseToolCallArgs(call), run.currentTools);
 
   let result = await raceWithSignal(dispatchToolCall(call, run.toolDispatchContext), input.signal);
   if (result.outcome === "failure") {
@@ -240,7 +341,7 @@ async function commitToolResult(
 ): Promise<ToolScheduleCommitDecision> {
   const { input } = run;
   const toolSideEffect = result.toolSideEffect
-    ?? resolveSideEffect(input.tools.find((tool) => tool.id === call.name), parseToolCallArgs(call));
+    ?? resolveToolDispatchSideEffect(call.name, parseToolCallArgs(call), run.currentTools);
 
   // 熔断计数（结果必经点）：failure 递增、success 清零、not_executed/unknown 不动
   const streaks = (run.state.toolFailureStreaks ??= {});
@@ -251,15 +352,30 @@ async function commitToolResult(
   if (result.toolOutputRef && !run.toolOutputs.some((entry) => entry.recordId === result.toolOutputRef?.recordId)) {
     run.toolOutputs.push(result.toolOutputRef);
   }
+  const tool = run.currentTools.find((candidate) => candidate.id === call.name);
+  const sensitiveOutput = tool?.sensitiveOutput === true;
+  const modelMessage = toolResultMessage(call, result);
+  const message = sensitiveOutput ? sensitiveTranscriptToolResult(call, result) : modelMessage;
   input.onEvent?.({
     type: "tool_end",
     toolCallId: call.id,
     outcome: result.outcome,
-    preview: (result.preview ?? result.message).slice(0, 200),
+    preview: (result.activityPreview ?? result.preview ?? result.message).slice(0, 200),
     // Diff Review 卡片证据走独立字段，不受 preview 截断影响
-    changes: extractFileChangesFromOutput(result.output),
+    changes: sensitiveOutput ? undefined : extractFileChangesFromOutput(result.output),
   });
-  run.messages.push(toolResultMessage(call, result));
+  await commitToolResultMessage(run, {
+    call,
+    message,
+    ...(sensitiveOutput ? { modelMessage } : {}),
+    outcome: result.outcome,
+    ...(!sensitiveOutput && result.fullOutputRef ? { fullRef: result.fullOutputRef } : {}),
+    roundId: `round-${run.rounds}`,
+    toolSideEffect,
+  });
+  if (result.presentation?.type === "mail_draft_card") {
+    input.onEvent?.({ type: "mail_draft_card", toolCallId: call.id, data: result.presentation.data });
+  }
   input.onToolLifecycle?.({
     toolCallId: call.id,
     toolName: call.name,
@@ -288,6 +404,20 @@ async function commitToolResult(
     return "halt";
   }
   return result.category === "fatal" ? "halt" : "continue";
+}
+
+function sensitiveTranscriptToolResult(call: ToolCall, result: ToolDispatchResult): ChatMessage {
+  const message = result.outcome === "success"
+    ? "邮件工具已运行；邮件内容未写入会话轨迹。"
+    : result.outcome === "unknown"
+      ? "邮件操作结果未知；请先在 Gmail 中核对，再决定是否重试。"
+      : "邮件操作未完成；详细内容未写入会话轨迹。";
+  return {
+    role: "tool",
+    toolCallId: call.id,
+    name: call.name,
+    content: JSON.stringify({ outcome: result.outcome, tool: call.name, message }),
+  };
 }
 
 // ── 内部工具 ─────────────────────────────────────────────

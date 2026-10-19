@@ -14,13 +14,27 @@ import { app } from "electron";
 import { toolRegistry } from "./registry/tool-registry";
 import { buildReplacedDiff, countLines, finalizeFileChanges } from "./registry/tool-evidence";
 import { applyStrReplaceEdits } from "./str-replace-core";
+import { resolveFileAccessPath } from "./file-access";
 import { currentUserTimezone } from "./built-in-tools";
 import { resolveTimeoutPolicy } from "../../runtime-policy";
 import { getDateLocale } from "../../locale-context";
 import { logger, LogTag } from "../../logger";
 import { getRunReviewTracker } from "../review/run-review-tracker";
+import { TtlResultCache } from "./builtin-tools/ttl-result-cache";
 
 const LOG_PREFIX = "[LifeTools]";
+
+// ── 汇率缓存 ─────────────────────────────────────────────
+// 模型可能反复查同一币种对（"再帮我算下 USD 人民币…"）；frankfurter 汇率
+// 本身一天才更新一次，30 分钟缓存零风险。只缓存汇率数值（不含金额）：
+// 同币种对不同金额命中时用当前 amount 重算。
+const EXCHANGE_CACHE_TTL_MS = 30 * 60_000;
+const exchangeCache = new TtlResultCache<number>(EXCHANGE_CACHE_TTL_MS);
+
+/** 清空汇率缓存（测试隔离用） */
+export function clearExchangeRateCache(): void {
+  exchangeCache.clear();
+}
 
 // ══════════════════════════════════════════════════════════
 // 记账
@@ -182,6 +196,14 @@ function registerExchangeRateTool(): void {
       if (from === to) {
         return `[exchange_rate] ${amount} ${from} = ${amount} ${to}（同币种）`;
       }
+      // 缓存命中：用当前 amount 重算，并标注汇率获取时间
+      const cacheKey = from + "|" + to;
+      const hit = exchangeCache.get(cacheKey);
+      if (hit) {
+        const fetchedAt = new Date(hit.at).toLocaleString("zh-CN", { hour12: false });
+        const hitResult = (amount * hit.value).toFixed(2);
+        return `[缓存] 汇率获取于 ${fetchedAt}，30 分钟内复用\n[exchange_rate] ${amount} ${from} = ${hitResult} ${to}（汇率 ${hit.value}，更新于 ${new Date(hit.at).toLocaleDateString(getDateLocale(), { timeZone: currentUserTimezone() })}）`;
+      }
       // frankfurter.app 免费、无 key、支持主要货币
       const url = `https://api.frankfurter.app/latest?from=${from}&to=${to}`;
       const resp = await fetch(url);
@@ -194,6 +216,8 @@ function registerExchangeRateTool(): void {
         return `[exchange_rate] 查不到 ${from} → ${to}，可能是不支持的币种`;
       }
       const result = (amount * rate).toFixed(2);
+      // 只有成功拿到汇率才写缓存；错误/不支持的币种不缓存
+      exchangeCache.set(cacheKey, rate);
       return `[exchange_rate] ${amount} ${from} = ${result} ${to}（汇率 ${rate}，更新于 ${new Date().toLocaleDateString(getDateLocale(), { timeZone: currentUserTimezone() })}）`;
     },
   });
@@ -248,7 +272,7 @@ function registerTranslateTool(): void {
       }
 
       // 动态 import 避免循环依赖；协议跟随档案配置（explicitTransport），与主链路同源
-      const { getAdapterForConfig } = await import("../vendors");
+      const { getAdapterForConfig } = await import("../vendors/index.js");
       const fromHint = args.from ? `（源语言：${args.from}）` : "（自动检测源语言）";
       const sysPrompt = `你是翻译器${fromHint}。把以下文本翻译成${to}，只输出译文，不要任何解释或额外文字。`;
       const ctrl = new AbortController();
@@ -337,13 +361,16 @@ function registerStrReplaceTool(): void {
       required: ["file_path"],
     },
     execute: async (args, ctx?) => {
-      const filePath = String(args.file_path || "");
+      let filePath = String(args.file_path || "");
       if (!filePath) return JSON.stringify({ success: false, errorCode: "INVALID_PATH", error: "file_path 不能为空", retryable: false });
+      const access = resolveFileAccessPath(path.resolve(ctx?.resolvedWorkspaceRoot ?? process.cwd(), filePath), "write", ctx);
+      if (!access.ok) return JSON.stringify({ success: false, errorCode: "PERMISSION_DENIED", category: "permission_denied", error: access.message, retryable: false });
+      filePath = access.path;
       if (!fs.existsSync(filePath)) {
         return JSON.stringify({
           success: false,
           errorCode: "FILE_NOT_FOUND",
-          error: `文件不存在：${filePath}。不要重复相同路径，请先用 read_file 或 search_text 确认文件存在。`,
+          error: `文件不存在：${filePath}。不要重复相同路径，请先用 Read 或 Grep 确认文件存在。`,
           retryable: true,
         });
       }

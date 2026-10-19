@@ -2,12 +2,14 @@ appId: com.cyrene.live2d
 productName: Cyrene
 publish:
   provider: github
-  owner: Playa-0v0
+  owner: Playa-Cyrene
   repo: Cyrene-Agent
 directories:
   output: release
 asar: true
 asarUnpack:
+  # Transformers.js 会静态加载 sharp；连同 libvips 依赖 DLL 一起解包，确保原生扩展能找到依赖。
+  - "**/node_modules/sharp/**"
   - "**/vendor/srt-win/**"
   - "**/node_modules/@ast-grep/**"
   # Playwright MCP 以 ELECTRON_RUN_AS_NODE 模式运行，读不了 asar 虚拟路径，
@@ -15,10 +17,27 @@ asarUnpack:
   - "**/node_modules/@playwright/**"
   - "**/node_modules/playwright/**"
   - "**/node_modules/playwright-core/**"
+  # Filesystem MCP 同理（dist/index.js + 其依赖的 sdk / diff / glob 等）
+  - "**/node_modules/@modelcontextprotocol/**"
+  - "**/node_modules/diff/**"
+  - "**/node_modules/glob/**"
+  - "**/node_modules/minimatch/**"
 electronDist: node_modules/electron/dist
 files:
   - dist/**/*
   - "!dist/components/**/*"
+  # 这些是本地性能测试、旧构建备份和模拟器产物，正式应用不依赖。
+  - "!dist/perf-normal{,/**/*}"
+  - "!dist/perf-profiling{,/**/*}"
+  - "!dist/renderer-old-*{,/**/*}"
+  - "!dist/sim{,/**/*}"
+  - "!dist/virtualization-*-build.log"
+  # 源码映射只供调试定位源码，正式运行不读取。
+  - "!**/*.map"
+  # Windows x64 安装包只携带 Windows x64 的 ONNX Runtime 文件。
+  - "!**/onnxruntime-node/bin/napi-v3/darwin/**/*"
+  - "!**/onnxruntime-node/bin/napi-v3/linux/**/*"
+  - "!**/onnxruntime-node/bin/napi-v3/win32/arm64/**/*"
   - package.json
   - assets/**/*
   - vendor/**/*
@@ -45,12 +64,17 @@ extraResources:
     to: cyrene-skills
 win:
   icon: assets/tray-icon.ico
+  # 保留应用支持的英文、简体中文和繁体中文界面语言。
+  electronLanguages:
+    - en-US
+    - zh-CN
+    - zh-TW
   target:
     - nsis
 nsis:
   artifactName: Cyrene-Setup-${version}.${ext}
   oneClick: false
-  differentialPackage: false
+  differentialPackage: true
   allowToChangeInstallationDirectory: true
   # Shortcut creation is controlled by the assisted install page below.
   createDesktopShortcut: false

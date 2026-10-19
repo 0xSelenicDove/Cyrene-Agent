@@ -1,14 +1,14 @@
-import { dialog } from "electron";
+import { app, dialog } from "electron";
 import * as fs from "fs";
 import * as path from "path";
 import { IPC } from "../../shared/ipc-channels";
+import type { SkillSuggestionMode } from "../../shared/skill-suggestions";
 import { createIpcScope, type IpcScope } from "../application/ipc-scope";
 import { getStickerManagerConfig, setStickerEnabled } from "../orchestrator/sticker-settings";
 import { addUserSticker, deleteUserSticker } from "../sticker-storage";
 import { loadMemoryPanelData } from "./panel";
-import { deleteImportedDoc } from "../rag";
-import { loadUserProfile, saveUserProfile, getAvatarPath } from "../settings-store";
-import { addMcpServer, removeMcpServer, listMcpServers } from "../orchestrator/mcp-manager";
+import { CYRENE_AVATAR_EXTENSIONS, findCyreneAvatarPath, getCyreneAvatarPath, loadUserProfile, saveUserProfile, getAvatarPath } from "../settings-store";
+import { addMcpServer, removeMcpServer, listMcpServers, listMcpServerConfigs } from "../orchestrator/mcp-manager";
 import { toolRegistry } from "../orchestrator/tools/registry/tool-registry";
 import type { ConversationMode } from "../../shared/chat-types";
 import { loadGeneralSettings, saveGeneralSettings } from "../settings/settings-facade";
@@ -17,29 +17,27 @@ import type { SkillMode } from "../skills/types";
 import type { WindowManager } from "../windows/window-manager";
 import {
   reactChatWindow,
-  sidebarWindow,
-  tasksWindow,
-  settingsWindow,
   stickerManagerWindow,
 } from "../windows/window-state";
-import type { EmbeddingIndexService } from "../services/embedding/embedding-index-service";
 import { memoryStore } from "./memory-store";
 import { exportMemoryToObsidianVault, syncToBoundVault } from "./obsidian-exporter";
 import { loadObsidianVaultConfig, saveObsidianVaultConfig, unbindVault } from "./obsidian-vault-config";
 import { startVaultWatcher, stopVaultWatcher } from "./obsidian-importer";
+import { activeConversationRegistry } from "../chats/active-conversation-registry";
+import * as chatsStore from "../chats/chats-store";
+import { loadSummaryMemoryContext } from "./summary-memory-context";
+import { isSummaryMemoryEnabled } from "./memory-mode";
 
 export interface MemoryUserToolIpcDependencies {
   get windowManager(): WindowManager | null;
-  embeddingIndexService: EmbeddingIndexService;
   /** 传入共享 scope 以便退出时统一注销；缺省时使用独立 scope。 */
   ipc?: IpcScope;
 }
 
 function broadcastToAuxWindows(channel: string, payload: unknown): void {
-  for (const win of [reactChatWindow, sidebarWindow, tasksWindow, settingsWindow]) {
-    if (win && !win.isDestroyed()) {
-      win.webContents.send(channel, payload);
-    }
+  const win = reactChatWindow;
+  if (win && !win.isDestroyed()) {
+    win.webContents.send(channel, payload);
   }
 }
 
@@ -47,7 +45,6 @@ const L0_EDITABLE_KEYS = ["preferredName", "occupation", "longTermInterests", "l
 const L1_EDITABLE_KEYS = ["recentGoals", "recentPreferences", "currentProject"];
 
 export function registerMemoryUserToolIpc(deps: MemoryUserToolIpcDependencies): void {
-  const { embeddingIndexService } = deps;
   const ipc = deps.ipc ?? createIpcScope();
   // 注意：windowManager 不解构，统一用 deps.windowManager 实时读取 getter。
   // registerMemoryUserToolIpc 在模块加载阶段调用，那时 windowManager 仍为 null，
@@ -94,8 +91,6 @@ export function registerMemoryUserToolIpc(deps: MemoryUserToolIpcDependencies): 
     };
     try {
       await addUserSticker(sourcePath, id, description, phrases);
-      embeddingIndexService.invalidateStickerEmbeddingIndex();
-      embeddingIndexService.refreshStickerEmbeddingIndex("user-sticker-add");
     } catch (err) {
       console.error("[stickers] add failed:", err);
       throw err;
@@ -106,8 +101,6 @@ export function registerMemoryUserToolIpc(deps: MemoryUserToolIpcDependencies): 
   ipc.handle(IPC.STICKERS_DELETE, async (_event, id: string) => {
     try {
       await deleteUserSticker(id);
-      embeddingIndexService.invalidateStickerEmbeddingIndex();
-      embeddingIndexService.refreshStickerEmbeddingIndex("user-sticker-delete");
     } catch (err) {
       console.error("[stickers] delete failed:", err);
       throw err;
@@ -136,12 +129,36 @@ export function registerMemoryUserToolIpc(deps: MemoryUserToolIpcDependencies): 
     return "data:" + mime + ";base64," + buf.toString("base64");
   });
 
+  ipc.handle(IPC.CYRENE_AVATAR_GET, () => {
+    try {
+      const avatarPath = findCyreneAvatarPath();
+      if (!avatarPath) return null;
+      const extension = path.extname(avatarPath).toLowerCase();
+      const mime = extension === ".jpg" || extension === ".jpeg"
+        ? "image/jpeg"
+        : extension === ".webp"
+          ? "image/webp"
+          : extension === ".bmp"
+            ? "image/bmp"
+            : "image/png";
+      return `data:${mime};base64,${fs.readFileSync(avatarPath).toString("base64")}`;
+    } catch {
+      return null;
+    }
+  });
+
   // Memory panel
   ipc.handle(IPC.MEMORY_PANEL_GET_DATA, () => loadMemoryPanelData());
-
-  ipc.handle(IPC.MEMORY_PANEL_DELETE_IMPORTED_DOC, (_event, payload: { importId: string; fileName?: string }) => {
-    const deleted = deleteImportedDoc(payload.importId, payload.fileName);
-    return { ok: true, deleted };
+  ipc.handle(IPC.MEMORY_PANEL_GET_SUMMARY, async () => {
+    if (!isSummaryMemoryEnabled()) return null;
+    const sessionId = activeConversationRegistry.getMostRecent()?.sessionId ?? (await chatsStore.getLatestSessionId());
+    if (!sessionId) return null;
+    const context = await loadSummaryMemoryContext({
+      conversationId: sessionId,
+      userDataRoot: app.getPath("userData"),
+      getSessionRecord: chatsStore.getSessionRecord,
+    });
+    return { sessionId, ...context };
   });
 
   ipc.handle(IPC.MEMORY_PANEL_SAVE_L0, async (_event, raw: Record<string, unknown>) => {
@@ -254,6 +271,59 @@ export function registerMemoryUserToolIpc(deps: MemoryUserToolIpcDependencies): 
     return { avatarPath, profile };
   });
 
+  ipc.handle(IPC.CYRENE_AVATAR_UPLOAD, async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ["openFile"],
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp", "bmp"] }],
+    });
+    if (result.canceled || result.filePaths.length === 0) return false;
+
+    const sourcePath = result.filePaths[0];
+    const extension = path.extname(sourcePath).toLowerCase();
+    if (!CYRENE_AVATAR_EXTENSIONS.includes(extension as typeof CYRENE_AVATAR_EXTENSIONS[number])) {
+      throw new Error("不支持的图片格式");
+    }
+
+    const targetPath = getCyreneAvatarPath(extension as typeof CYRENE_AVATAR_EXTENSIONS[number]);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    const uploadId = `${process.pid}-${Date.now()}`;
+    const tempPath = `${targetPath}.${uploadId}.tmp`;
+    const backupPath = `${targetPath}.${uploadId}.bak`;
+    let movedExistingTarget = false;
+    try {
+      fs.copyFileSync(sourcePath, tempPath);
+      if (fs.existsSync(targetPath)) {
+        fs.renameSync(targetPath, backupPath);
+        movedExistingTarget = true;
+      }
+      fs.renameSync(tempPath, targetPath);
+      if (movedExistingTarget) {
+        fs.rmSync(backupPath, { force: true });
+        movedExistingTarget = false;
+      }
+      for (const oldExtension of CYRENE_AVATAR_EXTENSIONS) {
+        const oldPath = getCyreneAvatarPath(oldExtension);
+        if (oldPath !== targetPath) fs.rmSync(oldPath, { force: true });
+      }
+    } catch (error) {
+      fs.rmSync(tempPath, { force: true });
+      if (movedExistingTarget && !fs.existsSync(targetPath)) {
+        fs.renameSync(backupPath, targetPath);
+      }
+      throw error;
+    }
+
+    deps.windowManager?.broadcast(IPC.CYRENE_AVATAR_CHANGED, null);
+    return true;
+  });
+
+  ipc.handle(IPC.CYRENE_AVATAR_RESET, () => {
+    for (const extension of CYRENE_AVATAR_EXTENSIONS) {
+      fs.rmSync(getCyreneAvatarPath(extension), { force: true });
+    }
+    deps.windowManager?.broadcast(IPC.CYRENE_AVATAR_CHANGED, null);
+  });
+
   // MCP servers
   ipc.handle(IPC.MCP_ADD_SERVER, async (_event, config: unknown) => {
     console.log("[MCP IPC] add-server:", JSON.stringify(config).slice(0, 200));
@@ -273,6 +343,11 @@ export function registerMemoryUserToolIpc(deps: MemoryUserToolIpcDependencies): 
     const servers = listMcpServers();
     console.log("[MCP IPC] list-servers:", servers.length + " servers");
     return servers;
+  });
+
+  // 持久化配置（含连接失败的），设置页列表以此为准
+  ipc.handle(IPC.MCP_LIST_SERVER_CONFIGS, () => {
+    return listMcpServerConfigs();
   });
 
   // Tool toggles
@@ -380,6 +455,19 @@ export function registerMemoryUserToolIpc(deps: MemoryUserToolIpcDependencies): 
         version: s.version,
         references: s.references,
       }));
+  });
+
+  // 输入框 slash 菜单：每次打开都重扫技能目录，确保用户刚安装/删除的 skill 即时可见。
+  // 模式过滤和启用状态统一复用注册表规则，渲染端只拿到菜单所需的可序列化字段。
+  ipc.handle(IPC.SKILL_GET_SUGGESTIONS, (_event, payload: unknown) => {
+    const mode = (payload as { mode?: unknown } | null)?.mode;
+    if (mode !== "work" && mode !== "code" && mode !== "learn") return [];
+
+    rescanSkills();
+    return skillRegistry
+      .getEnabledForMode(mode as SkillSuggestionMode, loadGeneralSettings().skillModeOverrides)
+      .filter((skill) => !skill.hiddenFromUi)
+      .map(({ id, name, description, source }) => ({ id, name, description, source }));
   });
 
   // 重新扫描 user skills 目录，安装/删除 skill 后无需重启即可刷新 UI。

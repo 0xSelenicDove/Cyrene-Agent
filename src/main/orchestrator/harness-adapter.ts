@@ -28,6 +28,9 @@ export { sendHarnessEventAsAgui, sendTaskLifecycleAsAgui } from "./harness/adapt
 import { completePlanRun } from "./harness/adapter/plan-lifecycle";
 import { prepareHarnessRun } from "./harness/adapter/run-preparation";
 import { prepareToolRuntime } from "./harness/adapter/tool-runtime";
+import { getTimeoutSettings } from "../timeout-manager";
+import { resolveModelRequestTimeoutMs } from "./config/model-timeout";
+import { getBrowserPanelController } from "../browser/browser-panel-runtime";
 
 const LOG_PREFIX = "[HarnessAdapter]";
 export { filterToolsForConversationMode } from "./harness/adapter/run-preparation";
@@ -47,7 +50,7 @@ export async function runHarnessWithAdapter(
   signal: AbortSignal,
   sendBaseEvent: (event: BaseEvent) => void,
 ): Promise<AgentLoopResult> {
-  // 准备阶段创建唯一的 runStore 实例；checkpoint、工具生命周期和终态都写入它。
+  // 准备阶段创建唯一的 runStore 实例；它只保存运行元数据和终态。
   const prepared = await prepareHarnessRun(options, signal);
   const {
     messageId,
@@ -57,15 +60,14 @@ export async function runHarnessWithAdapter(
     vendorConfig,
     tools,
     runStore,
-    recovered,
     promptLayers,
     harnessPromptLayers,
     systemPrompt,
     runMessages,
   } = prepared;
 
-  const toolRuntime = prepareToolRuntime({ options, signal, prepared, sendBaseEvent });
-  const { toolContext, checkPermission, toolOutputStore, taskExecutor } = toolRuntime;
+  const toolRuntime = await prepareToolRuntime({ options, signal, prepared, sendBaseEvent });
+  const { toolContext, checkPermission, toolOutputStore, taskExecutor, closeTaskExecutor, openTaskCompanions } = toolRuntime;
 
   // ── 构建 HarnessInput ──
   const harnessInput: HarnessInput = {
@@ -74,15 +76,18 @@ export async function runHarnessWithAdapter(
     usageParts: promptLayers.usageParts,
     messages: runMessages,
     runId,
-    ...(recovered ? { initialState: recovered.state } : {}),
-    ...(recovered ? { initialCache: recovered.cache } : {}),
+    assistantTurnId: options.assistantTurnId,
+    generatedImageStore: options.generatedImageStore,
     tools,
+    ...(options.initialHarnessState ? { initialState: options.initialHarnessState } : {}),
     vendorConfig,
     config: {
       maxParallelToolCalls: options.maxParallelToolCalls,
       // 0 表示禁用整轮执行时钟；单次模型/工具超时仍由各自策略处理。
       totalTimeoutMs: 0,
       contextWindowTokens: options.settings.contextWindowTokens,
+      modelRequestMaxRetries: options.settings.modelRequestMaxRetries ?? 5,
+      modelRequestIdleTimeoutMs: resolveModelRequestTimeoutMs(getTimeoutSettings()),
     },
     signal,
     onEvent: (event: HarnessEvent) => {
@@ -90,34 +95,23 @@ export async function runHarnessWithAdapter(
         sendHarnessEventAsAgui(event, messageId, threadId, runId, sendBaseEvent);
       }
     },
-    onCheckpoint: (checkpoint) => {
-      runStore.checkpoint(runId, {
-        messages: checkpoint.messages,
-        state: checkpoint.state,
-        toolOutputs: checkpoint.toolOutputs,
-        rounds: checkpoint.rounds,
-      });
-    },
-    onToolLifecycle: (event) => {
-      runStore.recordTool(runId, {
-        toolCallId: event.toolCallId,
-        toolName: event.toolName,
-        sideEffect: event.toolSideEffect,
-        status: event.status,
-      });
-    },
-    onCompactionLifecycle: (event) => runStore.recordCompaction(runId, event),
     ...(options.onToolFinished ? { onToolFinished: options.onToolFinished } : {}),
+    ...(options.pollRunAdjustments ? { pollRunAdjustments: options.pollRunAdjustments } : {}),
     requestUserClarification: options.requestUserClarification
       ? (card) => options.requestUserClarification!(card as never, signal)
       : undefined,
     includeInteractiveTools: options.harnessInteractiveTools,
     planState,
     toolContext,
+    browserControlState: () => getBrowserPanelController()?.getControlState(toolContext.conversationId, runId) ?? "inactive",
     toolOutputStore,
     executionLedger: options.executionLedger,
     checkPermission,
     taskExecutor,
+    closeTaskExecutor,
+    openTaskCompanions,
+    ...(options.transcriptSink ? { transcriptSink: options.transcriptSink } : {}),
+    ...(options.compactTranscript ? { compactTranscript: options.compactTranscript } : {}),
   };
 
   // ── 运行 Harness ──
@@ -133,15 +127,44 @@ export async function runHarnessWithAdapter(
   // 若 finalState.uncertainEffects 非空，externalEffectsMayContinue 必须为 true，
   // 即使 status=success 也不能谎报 false（unknown-side-effect 的诚实 final 是允许的）。
   const hasUncertainEffects = result.finalState.uncertainEffects.length > 0;
-  const terminal = result.terminal ?? mapTerminateReasonToTerminal(
+  let terminal = result.terminal ?? mapTerminateReasonToTerminal(
     result.terminateReason,
     hasUncertainEffects,
   );
-  const terminalRunStatus = terminal.status === "success"
+  let terminalRunStatus: "completed" | "cancelled" | "failed" = terminal.status === "success"
     ? "completed"
     : terminal.status === "cancelled" ? "cancelled" : "failed";
+
+  // ── 中断轨迹闭合（先于 runStore 终态结算）──
+  // 从权威轨迹闭合已声明但没有结果的工具，并写 interruption 边界；
+  // 闭合失败不得声称轨迹协议完整 → 转 runtime_error 终态（fail-closed）。
+  if (terminal.status === "cancelled" || result.terminateReason === "cancelled") {
+    try {
+      await options.transcriptSink?.closeInterruption({
+        reason: "user_cancel",
+        runSession: runStore.get(runId),
+      });
+    } catch (error) {
+      console.error(`${LOG_PREFIX} transcript interruption closure failed:`, error);
+      terminal = { status: "runtime_error", reason: "transcript_interruption_closure_failed", externalEffectsMayContinue: true };
+      terminalRunStatus = "failed";
+    }
+  } else if (terminal.status === "timeout" || terminal.status === "runtime_error") {
+    // 失败/超时终态同样写 interruption 边界：下一轮模型上下文才能区分
+    // 「系统没完成」与「用户主动取消」。闭合失败只记日志——终态本身就是
+    // 失败，无需像取消路径那样转写 runtime_error（else-if 也保证了取消闭合
+    // 失败转出的 runtime_error 不会二次写入不同 reason 的边界）
+    try {
+      await options.transcriptSink?.closeInterruption({
+        reason: "runtime_error",
+        runSession: runStore.get(runId),
+      });
+    } catch (error) {
+      console.error(`${LOG_PREFIX} transcript failure closure failed:`, error);
+    }
+  }
   // 终态持久化必须先于 Review 收尾：Review 读取的是刚写入的不可变 run 结果。
-  const finalSession = runStore.markTerminal(runId, terminalRunStatus);
+  const finalSession = await runStore.markTerminal(runId, terminalRunStatus);
 
   // ── Review 快照：Run 终止时生成不可变 ReviewSnapshot ──
   // 正常终止时主动 finalize；崩溃恢复（interrupted）的 Run 由前端打开 Review 时
@@ -157,8 +180,8 @@ export async function runHarnessWithAdapter(
 
   // ── 计划模式 run 尾钩──
   // 执行 run 结束（无论成败/取消）自动摘牌回 NORMAL；planPath 供前端"施工已完成"标注。
-  // PLAN_DISCUSSING → PLAN_REVIEW 的转换不在 adapter 做：审批流由 agui-bridge 在
-  // RUN_FINISHED 之后触发（需要 buildOptions 重开执行 run 的能力）。
+  // PLAN_DISCUSSING → PLAN_REVIEW 的迁移由 submit_plan 工具在 run 内完成（回执等待也在 run 内），
+  // adapter 只负责执行收尾广播。
   completePlanRun({
     mode: options.conversationMode,
     threadId,
@@ -179,6 +202,7 @@ export async function runHarnessWithAdapter(
     toolResults,
     completionReason,
     terminal,
+    ...(result.modelFailure ? { modelFailure: result.modelFailure } : {}),
     totalUsage: undefined,
   };
 }

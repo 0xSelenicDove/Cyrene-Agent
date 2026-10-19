@@ -7,20 +7,27 @@ import { isValidPluginVersion } from "../shared/version";
 import type {
   MarketInstallResult,
   MarketListResult,
+  MarketPluginDetails,
+  MarketPluginDetailsResult,
   MarketPluginEntry,
+  MarketSourceStatus,
 } from "../shared/plugin-management";
 import type { PluginImportResult } from "../plugins/manager";
 
-/** 官方插件市场索引源：主源直连 GitHub，兜底走 jsDelivr CDN（两者内容一致，缓存约 12 小时） */
+/** 官方插件市场索引源：GitHub 为主源、Gitee 兜底；市场面板会实时探测各源死活，并允许用户手动切换指定源 */
 export const MARKET_REGISTRY_URLS = [
   "https://raw.githubusercontent.com/Playa-0v0/Cyrene-Plugins/main/registry.json",
-  "https://cdn.jsdelivr.net/gh/Playa-0v0/Cyrene-Plugins@main/registry.json",
+  "https://gitee.com/playa0/cyrene-plugins/raw/main/registry.json",
 ] as const;
 
-/** 插件包只允许来自官方仓库的 Release 附件地址，防止索引被篡改后下载任意来源的包 */
-export const MARKET_ZIP_URL_PREFIX = "https://github.com/Playa-0v0/Cyrene-Plugins/releases/download/";
+/** 插件包只允许来自官方仓库的直链（GitHub Releases + Gitee raw zips/ 双前缀），防止索引被篡改后下载任意来源的包 */
+export const MARKET_ZIP_URL_PREFIXES: readonly string[] = [
+  "https://github.com/Playa-0v0/Cyrene-Plugins/releases/download/",
+  "https://gitee.com/playa0/cyrene-plugins/raw/main/zips/",
+];
 
 export const MARKET_REGISTRY_TIMEOUT_MS = 10_000;
+export const MARKET_DETAILS_MAX_BYTES = 64 * 1024;
 export const MARKET_ZIP_DOWNLOAD_TIMEOUT_MS = 120_000;
 export const MARKET_ZIP_MAX_BYTES = 50 * 1024 * 1024;
 
@@ -39,7 +46,7 @@ export type MarketplaceFetch = (
 
 export interface PluginMarketplaceDeps {
   registryUrls: readonly string[];
-  zipUrlPrefix: string;
+  zipUrlPrefixes: readonly string[];
   /** 下载的插件 zip 临时存放目录（如 userData/plugin-market-cache） */
   cacheDir: string;
   installZip: (
@@ -78,6 +85,34 @@ function isHttpsUrl(v: unknown): v is string {
   return typeof v === "string" && v.startsWith("https://");
 }
 
+function stringList(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 20) return null;
+  if (value.some((item) => !isNonEmptyString(item) || item.length > 500)) return null;
+  return value.map((item) => (item as string).trim());
+}
+
+function validateDetails(raw: unknown): MarketPluginDetails | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (record.schemaVersion !== 1) return null;
+  const features = stringList(record.features);
+  const requirements = stringList(record.requirements);
+  const setup = stringList(record.setup);
+  const dataHandling = stringList(record.dataHandling);
+  if (!features || !requirements || !setup || !dataHandling) return null;
+  const documentationUrl = record.documentationUrl;
+  if (documentationUrl !== undefined && !isHttpsUrl(documentationUrl)) return null;
+  return {
+    schemaVersion: 1,
+    features,
+    requirements,
+    setup,
+    dataHandling,
+    documentationUrl: typeof documentationUrl === "string" ? documentationUrl : undefined,
+  };
+}
+
 /** 单条目校验：不合法返回 null（调用方丢弃该条并记日志，不阻断整个列表） */
 function validateEntry(raw: unknown, deps: PluginMarketplaceDeps): (MarketPluginEntry & { zip: string; sha256: string }) | null {
   if (typeof raw !== "object" || raw === null) return null;
@@ -86,9 +121,10 @@ function validateEntry(raw: unknown, deps: PluginMarketplaceDeps): (MarketPlugin
   if (typeof id !== "string" || !ID_PATTERN.test(id)) return null;
   if (!isNonEmptyString(name) || !isNonEmptyString(description) || !isNonEmptyString(author)) return null;
   if (typeof version !== "string" || !isValidPluginVersion(version)) return null;
-  if (typeof zip !== "string" || !zip.startsWith(deps.zipUrlPrefix)) return null;
+  if (typeof zip !== "string" || !deps.zipUrlPrefixes.some((prefix) => zip.startsWith(prefix))) return null;
   if (typeof sha256 !== "string" || !SHA256_PATTERN.test(sha256)) return null;
-  if (typeof downloads !== "number" || !Number.isInteger(downloads) || downloads < 0) return null;
+  const normalizedDownloads = downloads === undefined ? 0 : downloads;
+  if (typeof normalizedDownloads !== "number" || !Number.isInteger(normalizedDownloads) || normalizedDownloads < 0) return null;
   if (homepage !== undefined && !isHttpsUrl(homepage)) return null;
   return {
     id,
@@ -96,7 +132,7 @@ function validateEntry(raw: unknown, deps: PluginMarketplaceDeps): (MarketPlugin
     version,
     description,
     author,
-    downloads,
+    downloads: normalizedDownloads,
     homepage: typeof homepage === "string" ? homepage : undefined,
     zip,
     sha256,
@@ -176,32 +212,90 @@ export function createPluginMarketplaceService(deps: PluginMarketplaceDeps) {
     }
   }
 
-  async function listMarket(): Promise<MarketListResult> {
+  async function listMarket(preferred?: string): Promise<MarketListResult> {
     const seq = ++listSeq;
+    // 若调用方指定偏好源且在候选里，就把它提前到探测队首，其余保持原优先级顺序
+    const ordered = preferred && deps.registryUrls.includes(preferred)
+      ? [preferred, ...deps.registryUrls.filter((url) => url !== preferred)]
+      : [...deps.registryUrls];
+    // 并发探测所有源：拿到每个源的死活状态供面板展示，数据取优先级最高的可用源
+    const probes = await Promise.all(
+      ordered.map(async (url) => {
+        try {
+          return { url, data: await fetchRegistryJson(url) } as const;
+        } catch (error) {
+          return { url, failure: errorMessage(error) } as const;
+        }
+      }),
+    );
+    const sources: MarketSourceStatus[] = [];
     const failures: string[] = [];
     let sawUnsupported = false;
-    for (const url of deps.registryUrls) {
+    let chosen: { plugins: MarketPluginEntry[]; snapshot: Map<string, MarketSnapshotEntry> } | null = null;
+    for (const probe of probes) {
+      if ("failure" in probe) {
+        sources.push({ url: probe.url, ok: false, used: false });
+        failures.push(`${probe.url}: ${probe.failure}`);
+        continue;
+      }
       try {
-        const data = await fetchRegistryJson(url);
-        const parsed = validateRegistry(data, deps);
-        if (seq === listSeq) {
-          // 只有最新一次请求才能落快照；过期响应的结果直接交还发起方但不改变状态
-          snapshot = parsed.snapshot;
-        }
-        return { ok: true, plugins: parsed.plugins };
+        const parsed = validateRegistry(probe.data, deps);
+        // 第一个通过校验的源作为数据源，其余可用源仅作展示（standby）
+        const used = chosen === null;
+        sources.push({ url: probe.url, ok: true, used });
+        if (used) chosen = parsed;
       } catch (error) {
-        failures.push(`${url}: ${errorMessage(error)}`);
+        sources.push({ url: probe.url, ok: false, used: false });
+        failures.push(`${probe.url}: ${errorMessage(error)}`);
         if (error instanceof RegistryFormatError && error.kind === "unsupported") {
           sawUnsupported = true;
         }
       }
+    }
+    if (chosen) {
+      if (seq === listSeq) {
+        // 只有最新一次请求才能落快照；过期响应的结果直接交还发起方但不改变状态
+        snapshot = chosen.snapshot;
+      }
+      return { ok: true, plugins: chosen.plugins, sources };
     }
     // 刷新失败清空快照：只有当前 UI 成功看到的列表才允许触发安装
     if (seq === listSeq) snapshot = null;
     const error = sawUnsupported
       ? "插件市场版本不受当前客户端支持，请更新应用"
       : `暂时无法获取插件列表: ${failures.join("；")}`;
-    return { ok: false, error, plugins: [] };
+    return { ok: false, error, plugins: [], sources };
+  }
+
+  async function getMarketDetails(id: string, preferred?: string): Promise<MarketPluginDetailsResult> {
+    if (!ID_PATTERN.test(id)) return { ok: false, error: "插件 ID 格式非法" };
+    const ordered = preferred && deps.registryUrls.includes(preferred)
+      ? [preferred, ...deps.registryUrls.filter((url) => url !== preferred)]
+      : [...deps.registryUrls];
+
+    for (const registryUrl of ordered) {
+      try {
+        const detailsUrl = new URL(registryUrl);
+        if (detailsUrl.protocol !== "https:" || !detailsUrl.pathname.endsWith("/registry.json")) continue;
+        detailsUrl.pathname = `${detailsUrl.pathname.slice(0, -"registry.json".length)}marketplace/${id}.json`;
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), registryTimeoutMs);
+        try {
+          const response = await fetchImpl(detailsUrl.href, { signal: controller.signal });
+          if (!response.ok) continue;
+          const text = await response.text();
+          if (text.length > MARKET_DETAILS_MAX_BYTES) continue;
+          const details = validateDetails(JSON.parse(text) as unknown);
+          if (details) return { ok: true, details };
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch {
+        // 详情文件可选：某个源缺失或暂时不可用时继续尝试下一个源。
+      }
+    }
+    return { ok: false, error: "插件详细信息暂不可用" };
   }
 
   async function sha256File(file: string): Promise<string> {
@@ -303,5 +397,5 @@ export function createPluginMarketplaceService(deps: PluginMarketplaceDeps) {
     }
   }
 
-  return { listMarket, installFromMarket };
+  return { listMarket, getMarketDetails, installFromMarket };
 }

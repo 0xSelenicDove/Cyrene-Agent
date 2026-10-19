@@ -1,37 +1,121 @@
 import type {
   ChatMessage,
+  ChatPresentationCheckpointPatch,
   ChatSession,
   ChatSessionMeta,
   ConversationMode,
+  PendingChatAttachment,
+  PendingChatMessage,
   ToolFileChange,
 } from "../../../../../shared/chat-types";
 import type {
   SpeechInputCommitRequest,
   SpeechInputCommitResult,
 } from "../../../../../shared/ipc-channels";
+import type { SidebarOrganizationDraft, SidebarOrganizationResult, SidebarOrganizationSnapshot } from "../../../../../shared/sidebar-organization";
+import type { TaskSession } from "../../../../../shared/task-session";
+import type { ModelFailureInfo } from "../../../../../shared/model-error";
+
+/** 认领队首的返回形状（与主进程 chats-store 的 ClaimPendingResult 对齐）。 */
+export type PendingClaimResult =
+  | {
+      ok: true;
+      claimed: true;
+      userMessage: ChatMessage;
+      visibleContent: string;
+      /** 模型侧文本：贴纸消息为「用户原话 + 表情包说明」；非贴纸消息缺省。 */
+      modelText?: string;
+      remainingQueue: PendingChatMessage[];
+      session: ChatSession;
+    }
+  | { ok: true; claimed: false }
+  | { ok: false; error: string };
+
+/** 修改/调整待发条目的返回形状：失败时附带主进程最新权威队列（可能缺省）。 */
+export type PendingMutationResult =
+  | { ok: true; queue: PendingChatMessage[] }
+  | { ok: false; error: string; queue?: PendingChatMessage[] };
 import type {
   PopQuizCard,
   PopQuizResolveResponse,
   PopQuizSettledPayload,
   PopQuizSubmission,
 } from "../../../../../shared/pop-quiz";
+import type { LearnExamAnswerValue, LearnExamChangedEvent, LearnExamCreatedEvent, LearnExamView } from "../../../../../shared/learn-exam";
+
+export interface LearnExamApi {
+  listByConversation: (conversationId: string) => Promise<LearnExamView[]>;
+  getView: (conversationId: string, examId: string) => Promise<{ ok: boolean; exam?: LearnExamView; error?: string }>;
+  saveAnswer: (conversationId: string, examId: string, questionId: string, answer: LearnExamAnswerValue | null) => Promise<{ ok: boolean; exam?: LearnExamView; error?: string }>;
+  saveNavigation: (conversationId: string, examId: string, activeQuestionId: string, flaggedQuestionIds: string[]) => Promise<{ ok: boolean; exam?: LearnExamView; error?: string }>;
+  submit: (conversationId: string, examId: string) => Promise<{ ok: boolean; shouldStartGrading?: boolean; exam?: LearnExamView; error?: string }>;
+  retry: (conversationId: string, examId: string) => Promise<{ ok: boolean; shouldStartGrading?: boolean; exam?: LearnExamView; error?: string }>;
+  markGradingFailed: (conversationId: string, examId: string) => Promise<{ ok: boolean; exam?: LearnExamView; error?: string }>;
+  onCreated: (callback: (event: LearnExamCreatedEvent) => void) => () => void;
+  onChanged: (callback: (event: LearnExamChangedEvent) => void) => () => void;
+}
 
 export interface ChatStoreApi {
   list: (options?: { mode?: ConversationMode }) => Promise<ChatSessionMeta[]>;
+  getSidebarOrganization: () => Promise<SidebarOrganizationSnapshot>;
+  applySidebarOrganization: (expectedRevision: number, draft: SidebarOrganizationDraft) => Promise<SidebarOrganizationResult>;
+  onSidebarOrganizationChanged: (callback: () => void) => () => void;
   get: (id: string) => Promise<ChatSession | null>;
+  getTaskSession: (taskId: string, parentConversationId: string) => Promise<TaskSession | null>;
   create: (input: { identityId: null; mode: ConversationMode; title?: string }) => Promise<ChatSession>;
-  append: (id: string, message: ChatMessage) => Promise<ChatSession | null>;
-  upsert: (id: string, message: ChatMessage) => Promise<ChatSession | null>;
-  replaceTail: (id: string, startIndex: number, messages: ChatMessage[]) => Promise<ChatSession | null>;
-  setMessageTtsCacheKey: (id: string, messageId: string, cacheKey: string, converterVersion: string) => Promise<ChatSession | null>;
+  checkpointPresentation: (
+    sessionId: string,
+    messageId: string,
+    mutationKey: string,
+    patch: ChatPresentationCheckpointPatch,
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   rename: (id: string, title: string) => Promise<ChatSession | null>;
   delete: (id: string) => Promise<boolean>;
+  // 会话级待发队列（主进程为权威）：入队失败时 ok=false，页面必须保留草稿
+  pendingEnqueue: (
+    id: string,
+    entry: Omit<PendingChatMessage, "enqueuedAt">,
+  ) => Promise<{ ok: true; queue: PendingChatMessage[] } | { ok: false; error: string }>;
+  pendingList: (id: string) => Promise<PendingChatMessage[] | null>;
+  pendingRemove: (id: string, messageId: string) => Promise<{ ok: boolean; error?: string }>;
+  // 认领队首（主进程单次写入：待发条目→正式用户消息+派发状态）；run 确认后清除派发状态
+  pendingClaim: (id: string) => Promise<PendingClaimResult>;
+  pendingCompleteDispatch: (
+    id: string,
+    messageId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  // 修改未认领条目文字（调用方按现有解析规则产出三个文字字段；冲突返回最新队列）
+  pendingEdit: (
+    id: string,
+    messageId: string,
+    update: { rawContent: string; visibleContent: string; userSticker?: string },
+  ) => Promise<PendingMutationResult>;
+  // 调整：把待发条目插入当前运行下一步；无活跃运行/带附件等明确拒绝并留队
+  pendingAdjust: (id: string, messageId: string) => Promise<PendingMutationResult>;
   setPinned: (id: string, pinned: boolean) => Promise<ChatSession | null>;
   setModelProfile: (id: string, modelProfileId?: string) => Promise<ChatSession | null>;
+  // 会话级当前模型窄 IPC：只写会话（绑定 + 模型），不碰档案；
+  // 失败返回错误码（invalid-payload / session-not-found / no-profile / invalid-model）
+  setSessionModel: (
+    id: string,
+    model: string,
+  ) => Promise<{ ok: true; session: ChatSession } | { ok: false; error: string }>;
   pickWorkspaceFolder: () => Promise<{ ok: boolean; path?: string; displayName?: string; error?: string }>;
+  listRecentProjects: () => Promise<string[]>;
+  // 验证工作区目录当前是否可用（存在且为目录）：失效路径不得显示为已选上
+  validateWorkspacePath: (workspaceRoot: string) => Promise<{ ok: boolean; path?: string; error?: string }>;
   setWorkspace: (sessionId: string, workspaceRoot: string) => Promise<{ ok: boolean; error?: string; isEmpty?: boolean }>;
+  // main → 渲染端：压缩阶段及占用，驱动消息流提示和上下文圆环。
+  onCompactionPhase: (callback: (payload: import("../../../../../shared/context-usage").ContextCompactionPhaseEvent) => void) => () => void;
   initLearnWorkspace: (sessionId: string) => Promise<{ ok: boolean; error?: string; created?: string[]; skipped?: string[] }>;
   openWorkspace: (workspaceRoot: string) => Promise<{ ok: boolean; error?: string }>;
+  // 聊天文件卡片右键菜单：本机默认方式打开 / 在资源管理器中定位工作区内文件
+  // （主进程校验路径在工作区内；失败静默，不弹错误）
+  shellFile: (
+    sessionId: string,
+    relPath: string,
+    action: "open" | "reveal",
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   setActiveSession: (sessionId: string | null, mode?: ConversationMode) => Promise<unknown>;
   onChanged: (callback: () => void) => () => void;
   onReactSwitchSession: (callback: (sessionId: string) => void) => () => void;
@@ -62,49 +146,61 @@ export interface AguiEvent {
   value?: unknown;
   toolCallId?: string;
   toolCallName?: string;
+  /** 主进程注册表里的中文展示名；用于工具执行卡片的用户可读标签。 */
+  toolCallDisplayName?: string;
   stepName?: string;
   status?: string;
   changes?: ToolFileChange[];
+  metadata?: { cyreneModelFailure?: ModelFailureInfo };
 }
+
+/** Harness 正文候选事件：只驱动本次运行的临时预览，不代表正式消息提交。 */
+export type CandidateTextEventValue =
+  | { action: "delta"; roundId: string; delta: string }
+  | { action: "discard"; roundId: string };
 
 export interface AguiApi {
   run: (input: {
-    messages: Array<{ role: "user" | "model"; content: string; at?: number }>;
-    userTurnId: string;
+    currentUser: {
+      turnId: string;
+      text: string;
+      visibleContent: string;
+      attachments?: PendingChatAttachment[];
+      sticker?: string;
+      at?: number;
+    };
     assistantTurnId: string;
     styleId?: string;
     sessionId: string;
     imageAttachments?: Array<{ name: string; filePath: string; mime?: string }>;
-    recoveryContext?: string;
-    resumeFromRunId?: string;
     takeoverFromRunId?: string;
-  }) => Promise<{ success: boolean; runId: string; error?: string }>;
+    /** 桌面 edit / regenerate 的轨迹回退锚点（主进程写 turn_rewind；渲染端只传元数据）。 */
+    transcriptRewind?: {
+      anchorUserTurnId: string;
+      expectedAssistantMessageId: string;
+      disposition: "keep_user" | "replace_user";
+    };
+  }) => Promise<import("../../../../../shared/run-terminal").AguiRunAck>;
   onEvent: (callback: (event: AguiEvent) => void) => () => void;
   cancel: (runId?: string) => Promise<unknown>;
   // 落盘确认（单向通知）：终态消息写入会话存储后上报，供插件轮次事件使用
   reportRunPersisted?: (payload: { runId: string; finalMessageId?: string }) => void;
-  getInterruptedRun?: (sessionId: string) => Promise<{ runId: string; rounds: number; todoCount: number; updatedAt: number } | null>;
 }
 
 export interface ChoiceApi {
   resolve: (id: string, value: unknown) => Promise<{ ok: boolean }>;
 }
 
-export interface PermissionApprovalRequest {
-  id: string;
-  runId?: string;
-  toolId: string;
-  toolName: string;
-  toolDescription: string;
-  args: Record<string, unknown>;
-  risk: string;
-}
+/**
+ * 审批载荷类型的唯一声明在 shared（主进程 / preload / 渲染端共用同一份）。
+ * 先 import 再导出：纯 re-export 的别名在本文件内不可见，下方接口要用。
+ */
+import type {
+  ApprovalRequest as PermissionApprovalRequest,
+  ApprovalSettledPayload as PermissionApprovalSettled,
+} from "../../../../../shared/permission-approval";
 
-export interface PermissionApprovalSettled {
-  id: string;
-  runId?: string;
-  reason: "answered" | "cancelled" | "unavailable";
-}
+export type { PermissionApprovalRequest, PermissionApprovalSettled };
 
 export interface SettingsApprovalApi {
   onPermissionApprovalRequest: (callback: (request: PermissionApprovalRequest) => void) => () => void;
@@ -146,4 +242,8 @@ export function choiceApi(): ChoiceApi | undefined {
 
 export function settingsApprovalApi(): SettingsApprovalApi | undefined {
   return (window as typeof window & { settings?: SettingsApprovalApi }).settings;
+}
+
+export function learnExamApi(): LearnExamApi | undefined {
+  return (window as typeof window & { learnExam?: LearnExamApi }).learnExam;
 }

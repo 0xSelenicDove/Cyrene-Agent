@@ -1,3 +1,5 @@
+import { useContext, useEffect } from "react";
+import { WorkspacePreviewContext } from "./WorkspacePreview";
 /**
  * SvgPreviewModal —— Mermaid 图 / SVG 学习卡片的放大预览。
  *
@@ -13,16 +15,30 @@ export function SvgPreviewModal({
   svg,
   open,
   onClose,
+  centered,
+  afterClose,
 }: {
   svg: string;
   open: boolean;
   onClose: () => void;
+  centered?: boolean;
+  afterClose?: () => void;
 }) {
   const { t } = useTranslation();
+  const openWorkspacePreview = useContext(WorkspacePreviewContext);
+  useEffect(() => {
+    if (open && openWorkspacePreview) {
+      openWorkspacePreview({ kind: "svg", svg });
+      onClose();
+    }
+  }, [open, svg, openWorkspacePreview, onClose]);
+  if (openWorkspacePreview) return null;
   return (
     <Modal
+      centered={centered}
       open={open}
       onCancel={onClose}
+      afterClose={afterClose}
       footer={null}
       title={t("messageList.diagramPreview")}
       width="min(1200px, 92vw)"

@@ -34,6 +34,7 @@ vi.mock("../../../i18n", () => {
         "pluginPanel.market.subtitle": "从官方收录仓库在线安装插件",
         "pluginPanel.market.toggle": "插件市场",
         "pluginPanel.market.back": "返回插件管理",
+        "pluginPanel.market.details": "详情",
         "pluginPanel.market.install": "安装",
         "pluginPanel.market.update": "更新",
         "pluginPanel.market.installing": "安装中…",
@@ -46,6 +47,12 @@ vi.mock("../../../i18n", () => {
         "pluginPanel.market.loadFailed": "获取插件列表失败：{{error}}",
         "pluginPanel.market.installFailed": "安装失败：{{error}}",
         "pluginPanel.market.installSuccess": "{{name}} 安装成功",
+        "pluginPanel.market.sourceUsed": "数据源",
+        "pluginPanel.market.sourceStandby": "可用",
+        "pluginPanel.market.sourceDead": "已死",
+        "pluginPanel.market.sourceSection": "数据源",
+        "pluginPanel.market.sourceGitee": "Gitee",
+        "pluginPanel.market.sourceGithub": "GitHub",
       };
   const t = (key: string, values?: Record<string, string>) => {
       if (key === "pluginPanel.developer") return `开发者：${values?.author}`;
@@ -56,6 +63,17 @@ vi.mock("../../../i18n", () => {
   };
   return { useTranslation: () => ({ t }) };
 });
+
+// 统一反馈入口的稳定 spy：断言删除插件走危险确认而非浏览器默认弹窗
+const feedbackSpies = vi.hoisted(() => ({
+  notice: vi.fn(),
+  alert: vi.fn(() => Promise.resolve()),
+  confirm: vi.fn(() => Promise.resolve(true)),
+}));
+
+vi.mock("../../../components/feedback/FeedbackProvider", () => ({
+  useFeedback: () => feedbackSpies,
+}));
 
 import { PluginModePanel, pluginToggleTarget, resolveMarketAction } from "./PluginModePanel";
 
@@ -102,6 +120,7 @@ function apiFor(items: PluginListEntry[]): PluginManagementApi {
     importZip: vi.fn(async () => ({ ok: false, canceled: true })),
     uninstall: vi.fn(async () => ({ ok: true, overview: { plugins: [], issues: [] } })),
     marketList: vi.fn(async () => ({ ok: true, plugins: [] })),
+    marketDetails: vi.fn(async () => ({ ok: false, error: "not implemented" })),
     marketInstall: vi.fn(async () => ({ ok: false, error: "not implemented" })),
   };
 }
@@ -113,6 +132,9 @@ describe("PluginModePanel", () => {
   beforeEach(() => {
     vi.stubGlobal("React", React);
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    feedbackSpies.notice.mockClear();
+    feedbackSpies.alert.mockClear().mockReturnValue(Promise.resolve());
+    feedbackSpies.confirm.mockClear().mockReturnValue(Promise.resolve(true));
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -181,6 +203,37 @@ describe("PluginModePanel", () => {
     expect(deleteButton?.title).toBe("内置插件不可删除");
   });
 
+  it("删除插件先走危险确认，确认后才卸载", async () => {
+    const api = apiFor([plugin()]);
+    await renderPanel(api);
+
+    const deleteButton = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "删除");
+    expect(deleteButton?.disabled).toBe(false);
+
+    await act(async () => deleteButton?.click());
+
+    // 危险确认：标题为删除、dangerous 标记、默认聚焦取消
+    expect(feedbackSpies.confirm).toHaveBeenCalledWith(expect.objectContaining({
+      title: "删除",
+      dangerous: true,
+    }));
+    expect(api.uninstall).toHaveBeenCalledWith("system-status");
+  });
+
+  it("危险确认取消时不卸载插件", async () => {
+    feedbackSpies.confirm.mockReturnValue(Promise.resolve(false));
+    const api = apiFor([plugin()]);
+    await renderPanel(api);
+
+    const deleteButton = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "删除");
+    await act(async () => deleteButton?.click());
+
+    expect(feedbackSpies.confirm).toHaveBeenCalledTimes(1);
+    expect(api.uninstall).not.toHaveBeenCalled();
+  });
+
   it("切换到市场视图拉取列表并渲染卡片，切回后恢复插件视图", async () => {
     const api = apiFor([]);
     (api.marketList as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -199,7 +252,7 @@ describe("PluginModePanel", () => {
     // 市场视图隐藏搜索框
     expect(container.querySelector(".plugin-panel__search")).toBeNull();
     // 未安装的市场插件展示粉色主按钮「安装」
-    const installButton = container.querySelector<HTMLButtonElement>(".plugin-card-ui__actions button");
+    const installButton = container.querySelector<HTMLButtonElement>(".plugin-card-ui__actions > button:last-child");
     expect(installButton?.textContent).toBe("安装");
     expect(installButton?.className).toContain("is-enabled");
 
@@ -234,7 +287,7 @@ describe("PluginModePanel", () => {
 
     const cards = [...container.querySelectorAll<HTMLElement>(".plugin-card-ui")];
     expect(cards).toHaveLength(6);
-    const buttons = cards.map((card) => card.querySelector<HTMLButtonElement>("button"));
+    const buttons = cards.map((card) => card.querySelector<HTMLButtonElement>(".plugin-card-ui__actions > button:last-child"));
     expect(buttons.map((button) => button?.textContent)).toEqual([
       "安装",
       "更新",
@@ -261,6 +314,73 @@ describe("PluginModePanel", () => {
     expect(container.textContent).toContain("获取插件列表失败：网络不可用");
   });
 
+  it("点击数据源 chip 会以该源 url 重新拉取市场列表", async () => {
+    const gitee = "https://gitee.com/playa0/cyrene-plugins/raw/main/registry.json";
+    const github = "https://raw.githubusercontent.com/Playa-0v0/Cyrene-Plugins/main/registry.json";
+    const api = apiFor([]);
+    (api.marketList as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      plugins: [marketEntry()],
+      sources: [
+        { url: github, ok: true, used: true },
+        { url: gitee, ok: true, used: false },
+      ],
+    });
+    await renderPanel(api);
+    await clickMarketToggle();
+
+    // 首次进入自动拉取（无偏好源）
+    expect(api.marketList).toHaveBeenCalledWith(undefined);
+
+    const chips = [...container.querySelectorAll<HTMLButtonElement>(".plugin-panel__source-chip")];
+    expect(chips).toHaveLength(2);
+    const giteeChip = chips.find((chip) => chip.textContent === "Gitee");
+    expect(giteeChip).toBeDefined();
+    await act(async () => giteeChip?.click());
+
+    expect(api.marketList).toHaveBeenLastCalledWith(gitee);
+    expect(api.marketList).toHaveBeenCalledTimes(2);
+  });
+
+  it("市场视图里点刷新会重新拉取市场列表，并沿用当前使用的数据源", async () => {
+    const github = "https://raw.githubusercontent.com/Playa-0v0/Cyrene-Plugins/main/registry.json";
+    const api = apiFor([]);
+    const marketList = api.marketList as ReturnType<typeof vi.fn>;
+    marketList.mockResolvedValueOnce({
+      ok: true,
+      plugins: [marketEntry({ downloads: 12 })],
+      sources: [{ url: github, ok: true, used: true }],
+    });
+    await renderPanel(api);
+    await clickMarketToggle();
+    expect(container.textContent).toContain("12 次下载");
+
+    // 注册表在此期间更新了下载量
+    marketList.mockResolvedValueOnce({
+      ok: true,
+      plugins: [marketEntry({ downloads: 30 })],
+      sources: [{ url: github, ok: true, used: true }],
+    });
+    const refresh = container.querySelector<HTMLButtonElement>('button[aria-label="刷新插件"]');
+    expect(refresh).not.toBeNull();
+    await act(async () => refresh?.click());
+
+    expect(api.rescan).toHaveBeenCalledTimes(1);
+    expect(marketList).toHaveBeenCalledTimes(2);
+    expect(marketList).toHaveBeenLastCalledWith(github);
+    expect(container.textContent).toContain("30 次下载");
+  });
+
+  it("插件视图里点刷新只重扫本地插件，不拉取市场列表", async () => {
+    const api = apiFor([plugin()]);
+    await renderPanel(api);
+    const refresh = container.querySelector<HTMLButtonElement>('button[aria-label="刷新插件"]');
+    await act(async () => refresh?.click());
+
+    expect(api.rescan).toHaveBeenCalledTimes(1);
+    expect(api.marketList).not.toHaveBeenCalled();
+  });
+
   it("安装成功后显示提示并刷新本地列表", async () => {
     const api = apiFor([]);
     (api.marketList as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -274,7 +394,7 @@ describe("PluginModePanel", () => {
     await renderPanel(api);
     await clickMarketToggle();
 
-    const installButton = container.querySelector<HTMLButtonElement>(".plugin-card-ui__actions button");
+    const installButton = container.querySelector<HTMLButtonElement>(".plugin-card-ui__actions > button:last-child");
     await act(async () => installButton?.click());
 
     expect(api.marketInstall).toHaveBeenCalledWith("market-demo");
@@ -295,7 +415,7 @@ describe("PluginModePanel", () => {
     await renderPanel(api);
     await clickMarketToggle();
 
-    const installButton = container.querySelector<HTMLButtonElement>(".plugin-card-ui__actions button");
+    const installButton = container.querySelector<HTMLButtonElement>(".plugin-card-ui__actions > button:last-child");
     await act(async () => installButton?.click());
 
     expect(container.textContent).toContain("安装失败：插件包校验失败");

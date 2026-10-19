@@ -5,6 +5,11 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { describe, expect, it, vi } from "vitest";
+import * as atomicRename from "../storage/rename-with-retry";
+
+vi.mock("../storage/rename-with-retry", async (original) => ({
+  ...await original<typeof import("../storage/rename-with-retry")>(),
+}));
 import {
   applyNightWindow,
   computeCharacterPostDelayMs,
@@ -83,6 +88,69 @@ function makeQueue(options: {
 }
 
 describe("反应队列持久化与执行", () => {
+  it.each(["stale", "retry", "decided"] as const)("retries only deletion after a %s task finishes", async (type) => {
+    const filePath = tempQueueFile();
+    fs.writeFileSync(filePath, JSON.stringify({ tasks: [{
+      id: "terminal", kind: "post_eval", actor: "cyrene", postId: "post-1",
+      dueAt: 0, attempts: type === "retry" ? 3 : 0,
+    }] }));
+    const harness = makeQueue({ filePath, executor: makeExecutor({
+      decide: async () => type === "decided"
+        ? { type, decision: { action: "like" } }
+        : { type, reason: "finished" },
+    }) });
+    const originalRename = atomicRename.renameWithRetrySync;
+    const failure = Object.assign(new Error("deletion busy"), { code: "EPERM" });
+    const rename = vi.spyOn(atomicRename, "renameWithRetrySync").mockImplementation((source, target) => {
+      if (target === filePath && JSON.parse(fs.readFileSync(source, "utf8")).tasks.length === 0) throw failure;
+      originalRename(source, target);
+    });
+    try {
+      if (type === "decided") await harness.queue.drainOnce();
+      else await expect(harness.queue.drainOnce()).rejects.toThrow(failure);
+      await harness.queue.drainOnce().catch(() => undefined);
+      expect(harness.queue.list()).toHaveLength(1);
+      expect(JSON.parse(fs.readFileSync(filePath, "utf8")).tasks).toHaveLength(1);
+      expect(harness.decide).toHaveBeenCalledTimes(1);
+      expect(harness.apply).toHaveBeenCalledTimes(type === "decided" ? 1 : 0);
+      rename.mockRestore();
+      await harness.queue.drainOnce();
+      expect(harness.queue.list()).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(filePath, "utf8")).tasks).toEqual([]);
+      expect(harness.decide).toHaveBeenCalledTimes(1);
+      expect(harness.apply).toHaveBeenCalledTimes(type === "decided" ? 1 : 0);
+    } finally {
+      rename.mockRestore();
+      fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+    }
+  });
+  it("retries removal in the same process after persistence fails without deciding again", async () => {
+    const filePath = tempQueueFile();
+    const harness = makeQueue({ filePath });
+    const task = harness.queue.enqueue({ kind: "post_eval", actor: "cyrene", postId: "post-1" });
+    const originalRename = atomicRename.renameWithRetrySync;
+    const rename = vi.spyOn(atomicRename, "renameWithRetrySync").mockImplementation((source, target) => {
+      if (target === filePath && JSON.parse(fs.readFileSync(source, "utf8")).tasks.length === 0) {
+        throw Object.assign(new Error("target still busy"), { code: "EPERM" });
+      }
+      originalRename(source, target);
+    });
+    try {
+      await harness.queue.drainOnce();
+      expect(harness.queue.list().map(item => item.id)).toEqual([task!.id]);
+      expect(JSON.parse(fs.readFileSync(filePath, "utf8")).tasks).toHaveLength(1);
+      expect(harness.decide).toHaveBeenCalledTimes(1);
+      rename.mockRestore();
+      await harness.queue.drainOnce();
+      expect(harness.queue.list()).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(filePath, "utf8")).tasks).toEqual([]);
+      expect(harness.decide).toHaveBeenCalledTimes(1);
+    } finally {
+      rename.mockRestore();
+      fs.rmSync(path.dirname(filePath), { recursive: true, force: true });
+    }
+  });
+
   it("入队即落盘，重启后从磁盘恢复未完成任务", () => {
     const filePath = tempQueueFile();
     const first = makeQueue({ filePath, now: 5_000 });
@@ -368,7 +436,9 @@ describe("长尾延迟分桶", () => {
     return counts.map((count) => count / delays.length);
   }
 
-  it("角色表态延迟：桶占比约 50/30/15/5，延迟在 3 分钟 ~ 4 小时内", () => {
+  // 10 万样本的统计压测在 CI 的 4 核 runner 上可能超过默认 5s，
+  // 超时会导致 vitest 杀掉整个 fork worker（波及同 worker 的其他文件）
+  it("角色表态延迟：桶占比约 50/30/15/5，延迟在 3 分钟 ~ 4 小时内", { timeout: 60_000 }, () => {
     const random = createSeededRandom(42);
     const delays = Array.from({ length: SAMPLES }, () => computeCharacterPostDelayMs(random));
 
@@ -387,7 +457,7 @@ describe("长尾延迟分桶", () => {
     expect(ratios[3]).toBeLessThan(0.07);
   });
 
-  it("角色回复延迟：桶占比约 50/30/20，延迟在 5 ~ 60 分钟内", () => {
+  it("角色回复延迟：桶占比约 50/30/20，延迟在 5 ~ 60 分钟内", { timeout: 60_000 }, () => {
     const random = createSeededRandom(7);
     const delays = Array.from({ length: SAMPLES }, () => computeCharacterReplyDelayMs(random));
 
@@ -404,7 +474,7 @@ describe("长尾延迟分桶", () => {
     expect(ratios[2]).toBeLessThan(0.22);
   });
 
-  it("昔涟在线：表态 1~8 分钟、回复 1~5 分钟", () => {
+  it("昔涟在线：表态 1~8 分钟、回复 1~5 分钟", { timeout: 30_000 }, () => {
     const random = createSeededRandom(99);
     for (let i = 0; i < 10_000; i++) {
       const post = computeCyrenePostDelayMs(true, random);
@@ -416,7 +486,7 @@ describe("长尾延迟分桶", () => {
     }
   });
 
-  it("昔涟离线：表态与回复都落在 1~40 分钟，回复整体比表态偏快", () => {
+  it("昔涟离线：表态与回复都落在 1~40 分钟，回复整体比表态偏快", { timeout: 30_000 }, () => {
     const random = createSeededRandom(1234);
     const posts: number[] = [];
     const replies: number[] = [];

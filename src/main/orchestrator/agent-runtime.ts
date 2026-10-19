@@ -1,3 +1,5 @@
+import { app } from "electron";
+import path from "node:path";
 import { loadPromptFile } from "../prompts/prompt-loader";
 import type { AguiRunInput } from "../agui-bridge";
 import type { ScheduledTask } from "../scheduler/types";
@@ -5,16 +7,19 @@ import type { ChannelId } from "../channels/types";
 import type { ModelSettings } from "../settings/model-settings";
 import type { GeneralSettings } from "../settings/general-settings";
 import type { UserProfile } from "../settings-store";
-import { loadVisionConfig } from "../settings/model-settings";
+import { resolveCaptionVisionConfig } from "./image-router";
 import { getTimeoutSettings } from "../timeout-manager";
 import { resolveModelSettingsProfile } from "../settings/model-settings";
 import { normalizeChatMessages } from "../chat-api-utils";
 import { parseObserverFeeling } from "../chat-stream-utils";
-import { validateCaptionImagePath, IMAGE_CAPTION_PROMPT } from "../chat/image-caption";
+import { captionImageSafe, IMAGE_CAPTION_PROMPT } from "../chat/image-caption";
 import { buildEnvironmentContext } from "./environment";
 import { buildToneInjection } from "./tone-injector";
 import { buildAlwaysOnContext, scheduleMemoryWrite } from "./index";
-import { matchSticker } from "../sticker-embedder";
+import { scheduleSummaryTurn } from "../memory/summary-memory-scheduler";
+import { scheduleWikiTurn } from "../memory/wiki-memory-scheduler";
+import { matchSticker } from "../sticker-text-matcher";
+import type { StickerTextEntry } from "../sticker-text-matcher";
 import { buildRelationshipContext, recordRelationshipTurn } from "../relationship/relationship-log";
 import { compileSocialContextBlock } from "../social-context/context";
 import * as momentsStore from "../moments/moments-store";
@@ -40,6 +45,11 @@ import {
   type OnRunFinishedDeps,
   type ModelSettingsLite,
 } from "./build-options";
+import { buildModelContext } from "./conversation-transcript-context";
+import { getConversationTranscriptStore } from "./conversation-transcript-store";
+import { createGeneratedImageStore } from "../chats/generated-image-store";
+import { getHarnessRunStore } from "./harness/run-store";
+import { ConversationTranscriptCompactor } from "./conversation-transcript-compactor";
 import { type CyreneRunResult, type CyreneRunOptions } from "./cyrene-agent";
 import type { HarnessToolFinishedEvent } from "./harness/types";
 import type { ToolFinishedInput } from "../plugin-host/lifecycle-publisher";
@@ -79,19 +89,21 @@ export interface AgentRuntimeDeps {
     getEnabledToolsForMode: (mode: ConversationMode, overrides?: ToolModeOverrides) => ToolDefinition[];
   };
   skillRegistry: typeof skillRegistry;
-  getSceneEmbeddingIndex: () => unknown;
-  getStickerEmbeddingIndex: () => unknown;
-  getEmbeddingProvider: () => unknown;
-  getSceneEmbeddingProvider: () => unknown;
+  getStickerTextIndex: () => readonly StickerTextEntry[];
   broadcastRuntimeStateChanged: () => void;
   citaService: CitaService;
   socialContextScheduler: { schedule: (input: SocialExtractionInput) => void };
-  chatsStore: { getWorkspaceBinding: (conversationId: string) => { workspaceRoot: string; displayName: string; boundAt: number } | undefined };
+  chatsStore: { getWorkspaceBinding: (conversationId: string) => ({ workspaceRoot: string; displayName: string; boundAt: number } | undefined) | Promise<{ workspaceRoot: string; displayName: string; boundAt: number } | undefined> };
   socialAtomStore: { listActive: (conversationId: string, now: number) => SocialAtom[] };
+  buildSummaryMemoryContext?: (conversationId: string) => Promise<{ stablePrompt: string; runtimeContext: string }>;
+  scheduleSummaryTurn?: (input: Parameters<typeof scheduleSummaryTurn>[0]) => void;
+  scheduleWikiTurn?: (input: Parameters<typeof scheduleWikiTurn>[0]) => void;
   buildPluginPromptContext: (input: PluginPromptBuildInput) => Promise<string>;
   publishPluginHostEvent: <T>(event: string, payload: T) => Promise<void>;
   /** 工具完成事件发布入口；缺省不发布（早期装配与测试场景）。 */
   publishToolFinished?: (event: ToolFinishedInput) => void;
+  /** Composition-root-owned singleton shared with manual CHATS_COMPACT. */
+  transcriptCompactor?: ConversationTranscriptCompactor;
 }
 
 type SchedulerRunOptions = Omit<CyreneRunOptions, "toolSystemContent" | "soulSystemBaseContent">;
@@ -102,6 +114,8 @@ export interface AgentRunFinishedContext {
   conversationId: string;
   channel?: string;
   runId?: string;
+  assistantEntryId?: string;
+  userTurnId?: string;
 }
 
 export interface AgentRuntime {
@@ -112,6 +126,18 @@ export interface AgentRuntime {
 
 export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
   const runtimeStateService = rawDeps.runtimeStateService;
+  const transcriptStore = getConversationTranscriptStore(app.getPath("userData"));
+  const generatedImageStore = createGeneratedImageStore({
+    rootDirectory: path.join(app.getPath("userData"), "chat-media", "generated-images"),
+  });
+  const transcriptRunStore = getHarnessRunStore(app.getPath("userData"));
+  // Production composition owns the singleton; unit/fallback callers retain
+  // the same service contract but fail closed until one is injected.
+  const transcriptCompactor = rawDeps.transcriptCompactor ?? new ConversationTranscriptCompactor({
+    store: transcriptStore,
+    runReader: transcriptRunStore,
+    summarize: async () => { throw new Error("TRANSCRIPT_COMPACTION_REQUIRED"); },
+  });
 
   async function observeRuntimeState(
     settings: ModelSettingsLite,
@@ -160,8 +186,8 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
       loadModelSettings: (modelProfileId?: string) => resolveModelSettingsProfile(rawDeps.loadModelSettings(), modelProfileId),
       loadGeneralSettings: () => rawDeps.loadGeneralSettings(),
       loadUserProfile: () => rawDeps.loadUserProfile(),
-      buildEnvironmentContext: ((model, profile) =>
-        buildEnvironmentContext(model, profile as any)) as BuildOptionsDeps["buildEnvironmentContext"],
+      buildEnvironmentContext: ((profile) =>
+        buildEnvironmentContext(profile as any)) as BuildOptionsDeps["buildEnvironmentContext"],
       buildSkillCatalog: ((skills) =>
         buildSkillCatalog(skills as any)) as BuildOptionsDeps["buildSkillCatalog"],
       buildAutoInjectedSkillContext: ((skills) =>
@@ -180,11 +206,7 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
       },
       resolveSlashActivation: ((messages, mode, overrides) =>
         resolveSlashActivation(messages as any, mode, overrides)) as BuildOptionsDeps["resolveSlashActivation"],
-      buildToneInjection: ((userText, messages, provider, index) =>
-        buildToneInjection(userText, messages as any, provider as any, index as any)) as BuildOptionsDeps["buildToneInjection"],
-      sceneEmbeddingIndex: rawDeps.getSceneEmbeddingIndex(),
-      getSceneEmbeddingProvider: (() =>
-        rawDeps.getSceneEmbeddingProvider() as unknown) as BuildOptionsDeps["getSceneEmbeddingProvider"],
+      buildToneInjection: (() => buildToneInjection()) as BuildOptionsDeps["buildToneInjection"],
       buildAlwaysOnContext: ((userText, messages) =>
         buildAlwaysOnContext(userText, messages as any)) as BuildOptionsDeps["buildAlwaysOnContext"],
       buildRelationshipContext,
@@ -192,8 +214,8 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
       buildToolSystemPrompt: ((mode, enabledTools) =>
         buildToolSystemPrompt(mode, enabledTools as ToolDefinition[])) as BuildOptionsDeps["buildToolSystemPrompt"],
       buildSoulSystemBasePrompt,
-      resolveRunCapabilities: ({ mode, activeSearchBackend, toolModeOverrides, skillModeOverrides, chatToolsEnabled }) => resolveRunCapabilities({
-        mode, activeSearchBackend, toolModeOverrides, skillModeOverrides, chatToolsEnabled,
+      resolveRunCapabilities: ({ mode, activeSearchBackend, toolModeOverrides, skillModeOverrides, chatToolsEnabled, hasFileAttachments }) => resolveRunCapabilities({
+        mode, activeSearchBackend, toolModeOverrides, skillModeOverrides, chatToolsEnabled, hasFileAttachments,
         toolRegistry: rawDeps.toolRegistry,
         skillRegistry: rawDeps.skillRegistry,
       }),
@@ -208,22 +230,11 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
         normalizeChatMessages(raw as any)) as BuildOptionsDeps["normalizeChatMessages"],
       chatRequestTimeoutMs: getTimeoutSettings().chatRequestTimeout,
       captionImageForFallback: async (filePath: string) => {
-        const validated = validateCaptionImagePath(filePath);
-        if (!validated.ok) return { ok: false, error: validated.error };
-        const visionCfg = loadVisionConfig();
-        if (!visionCfg) return { ok: false, error: "未配置视觉模型，无法分析图片" };
-        try {
-          const { captionImage } = await import("./vision-captioner");
-          const caption = await captionImage(
-            { base64: validated.buffer.toString("base64"), mime: validated.mime },
-            IMAGE_CAPTION_PROMPT,
-            visionCfg,
-          );
-          if (caption.startsWith("[错误")) return { ok: false, error: caption };
-          return { ok: true, caption };
-        } catch (err: any) {
-          return { ok: false, error: err?.message || String(err) };
-        }
+        // 走注入的设置加载（与 buildSchedulerOptions 同策略），保证可测且不绕过依赖装配
+        const settings = resolveModelSettingsProfile(rawDeps.loadModelSettings());
+        const vision = resolveCaptionVisionConfig(settings);
+        if (!vision.ok) return { ok: false, error: vision.error };
+        return captionImageSafe(filePath, IMAGE_CAPTION_PROMPT, vision.config);
       },
       prepareCitaTurn: (input) => rawDeps.citaService.prepareTurn(input),
       buildChatSocialContext: async ({ conversationId, query }) => {
@@ -236,14 +247,25 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
         };
       },
       buildMomentsContext: (query: string) => {
-        // 只读本地 moments 数据（内存缓存），同步返回；initialize 幂等防御装配顺序
-        momentsStore.initialize();
+        // 只读本地 moments 数据（内存缓存），同步返回。
+        // 读模型由 registerMomentsIpc 的 await initialize 装载（先于任何运行入口）；
+        // 万一装配顺序被打乱，这里降级为无 moments 上下文而不是抛错。
+        if (!momentsStore.isReady()) return "";
         return buildMomentsContextBlock(momentsStore.listFeed({ limit: 20 }), query, Date.now());
       },
-      getWorkspaceBinding: (conversationId: string) => {
-        return rawDeps.chatsStore.getWorkspaceBinding(conversationId);
+      getWorkspaceBinding: async (conversationId: string) => {
+        return (await rawDeps.chatsStore.getWorkspaceBinding(conversationId));
       },
+      buildSummaryMemoryContext: rawDeps.buildSummaryMemoryContext,
       buildPluginPromptContext: (input) => rawDeps.buildPluginPromptContext(input),
+      // 权威轨迹上下文（CTA Phase 1）：桌面端与 bridge 共用同一 userData 根下的单例 store
+      buildModelContext: (conversationId, retainTokens) => buildModelContext({
+        store: transcriptStore,
+        conversationId,
+        retainTokens,
+        runReader: transcriptRunStore,
+      }),
+      compactTranscript: (input) => transcriptCompactor.compact(input),
     };
   }
 
@@ -251,6 +273,8 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
     return {
       loadModelSettings: () => rawDeps.loadModelSettings(),
       scheduleMemoryWrite,
+      scheduleSummaryTurn: rawDeps.scheduleSummaryTurn ?? ((input) => scheduleSummaryTurn(input)),
+      scheduleWikiTurn: rawDeps.scheduleWikiTurn ?? ((input) => scheduleWikiTurn(input)),
       scheduleSocialAtomExtraction: (input) => rawDeps.socialContextScheduler.schedule(input),
       scheduleMomentsTurn: (input) => momentsService.scheduleTurn(input),
       inferRuntimeState: ((userText, reply, flag) =>
@@ -259,12 +283,8 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
       feelingToExpression,
       setRuntimeState: ((next) =>
         runtimeStateService.setStateWithoutNotify(next as any)) as OnRunFinishedDeps["setRuntimeState"],
-      stickerEmbeddingIndex: rawDeps.getStickerEmbeddingIndex(),
-      getEmbeddingProvider: (() => rawDeps.getEmbeddingProvider() as unknown) as OnRunFinishedDeps["getEmbeddingProvider"],
-      matchSticker: ((text, provider, index, threshold) =>
-        matchSticker(text, provider as any, index as any, threshold) as Promise<{
-          id: string;
-        } | null | undefined>) as OnRunFinishedDeps["matchSticker"],
+      stickerTextIndex: rawDeps.getStickerTextIndex(),
+      matchSticker,
       loadStickerSettings,
       broadcastRuntimeStateChanged: rawDeps.broadcastRuntimeStateChanged,
       observeRuntimeState: ((settings, history, userText, reply) =>
@@ -283,7 +303,15 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
     buildOptions: async (input) => {
       const buildOptionsDeps = buildBuildOptionsDeps();
       const { options, latestUserText } = await buildAgentRunOptions(input, buildOptionsDeps);
-      return { options: { ...options, onToolFinished }, latestUserText };
+      return {
+        options: {
+          ...options,
+          onToolFinished,
+          assistantTurnId: input.assistantTurnId,
+          generatedImageStore,
+        },
+        latestUserText,
+      };
     },
 
     onRunFinished: async (result, latestUserText, context) => {
@@ -294,7 +322,10 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
         onRunFinishedDeps,
         context.channel as ChannelId | undefined,
         context.conversationId,
-        { runId: context.runId, source: context.source, mode: context.mode },
+        { runId: context.runId, source: context.source, mode: context.mode,
+          vectorMemorySource: context.userTurnId && context.assistantEntryId
+            ? { userTurnId: context.userTurnId, assistantEntryId: context.assistantEntryId }
+            : undefined },
       );
       // 调用方应只在成功终态进入收尾；此处再守住插件事件契约，避免未来新增入口误报完成。
       const terminalStatus = result.terminal?.status;
@@ -332,7 +363,7 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
         : rawDeps.skillRegistry.getEnabledForMode(mode, generalSettings.skillModeOverrides);
       const systemContent = [
         buildModePrompt(mode),
-        buildEnvironmentContext({ provider: settings.provider, model: settings.model }, profile),
+        buildEnvironmentContext(profile),
         buildSkillCatalog(scheduledSkills),
         await buildAlwaysOnContext(task.prompt, messages),
         await rawDeps.buildPluginPromptContext({
@@ -350,7 +381,9 @@ export function createAgentRuntime(rawDeps: AgentRuntimeDeps): AgentRuntime {
           // 协议与推理偏好需与聊天路径一致透传，否则定时任务会按默认协议发请求。
           explicitTransport: settings.explicitTransport,
           reasoning: settings.reasoning,
+          manualReasoning: settings.manualReasoning,
           contextWindowTokens: settings.contextWindowTokens,
+          modelRequestMaxRetries: settings.modelRequestMaxRetries ?? 5,
         },
         messages: [{ role: "system" as const, content: systemContent }, ...messages],
         // 定时任务也不因整轮耗时被中断；仍保留单次模型/工具自身的超时。

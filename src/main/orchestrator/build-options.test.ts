@@ -1,14 +1,15 @@
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import {
-  buildAgentRunOptions,
+  buildAgentRunOptions as buildAgentRunOptionsProduction,
   buildChannelSystem,
   onAgentRunFinished,
   type BuildOptionsDeps,
   type OnRunFinishedDeps,
 } from "./build-options"
+import type { MaterializedTranscript } from "./conversation-transcript-context"
 import type { SocialAtom } from "../social-context/types"
 import type { ConversationMode } from "../../shared/chat-types"
 
@@ -33,9 +34,7 @@ function createBuildDeps(): BuildOptionsDeps {
       getBody: () => null,
     },
     resolveSlashActivation: () => "",
-    buildToneInjection: async () => "",
-    sceneEmbeddingIndex: null,
-    getSceneEmbeddingProvider: () => null,
+    buildToneInjection: () => "",
     buildAlwaysOnContext: async () => "ALWAYS",
     buildRelationshipContext: async () => "RELATIONSHIP",
     buildSystemPrompt: () => "BASE_SYSTEM",
@@ -56,6 +55,26 @@ function createBuildDeps(): BuildOptionsDeps {
   }
 }
 
+// 测试夹具把历史消息物化为 canonical journal 的 modelContext；生产入口不再接受旁路 messages。
+async function buildAgentRunOptions(
+  input: Record<string, unknown>,
+  deps: BuildOptionsDeps,
+) {
+  const rawMessages = input.messages
+  const { messages: _legacyMessages, ...canonicalInput } = input
+  const modelContext = !canonicalInput.currentUser && Array.isArray(rawMessages)
+    ? {
+      messages: rawMessages,
+      uncertainEffects: [],
+      throughSeq: 0,
+    } as MaterializedTranscript
+    : undefined
+  return buildAgentRunOptionsProduction({
+    ...canonicalInput,
+    ...(modelContext ? { modelContext } : {}),
+  } as never, deps)
+}
+
 describe("build-options", () => {
   it.each(["chat", "work", "learn", "code"] as const)("uses the explicit %s mode prompt", async (mode) => {
     const deps = createBuildDeps();
@@ -67,6 +86,28 @@ describe("build-options", () => {
       messages: [{ role: "user", content: "你好" }],
     }, deps);
     expect(result.options.soulSystemBaseContent).toContain(`[MODE:${mode}]`);
+  });
+
+  it("把全局模型重试设置冻结进聊天运行配置，旧设置默认为 5", async () => {
+    const deps = createBuildDeps();
+    const defaultResult = await buildAgentRunOptions({
+      sessionId: "retry-default",
+      mode: "chat",
+      executionMode: "chat",
+      messages: [{ role: "user", content: "你好" }],
+    }, deps);
+    expect(defaultResult.options.settings.modelRequestMaxRetries).toBe(5);
+
+    deps.loadModelSettings = () => ({
+      provider: "test", baseUrl: "https://example.test", model: "m", apiKey: "k", modelRequestMaxRetries: 3,
+    });
+    const configuredResult = await buildAgentRunOptions({
+      sessionId: "retry-configured",
+      mode: "work",
+      executionMode: "work",
+      messages: [{ role: "user", content: "开始" }],
+    }, deps);
+    expect(configuredResult.options.settings.modelRequestMaxRetries).toBe(3);
   });
 
   it("把插件贡献放入每轮 runtime context，并传递可信运行元数据", async () => {
@@ -93,6 +134,29 @@ describe("build-options", () => {
     expect(result.options.soulRuntimeContext).toContain("[插件上下文：demo]\nchat:今天天气如何");
     expect(result.options.soulSystemBaseContent).not.toContain("插件上下文：demo");
     expect(result.options.toolSystemContent).not.toContain("插件上下文：demo");
+  });
+
+  it("无头插件任务把显式 promptSource 传给插件提示词 Provider", async () => {
+    const deps = createBuildDeps();
+    deps.buildPluginPromptContext = vi.fn(async (input) => `[${input.source}] ${input.channel}`);
+
+    const result = await buildAgentRunOptions({
+      sessionId: "plugin:minecraft-bot",
+      mode: "work",
+      executionMode: "work",
+      promptSource: "plugin-agent",
+      promptChannel: "minecraft",
+      messages: [{ role: "user", content: "收集木头" }],
+    } as never, deps);
+
+    expect(deps.buildPluginPromptContext).toHaveBeenCalledWith({
+      source: "plugin-agent",
+      mode: "work",
+      userText: "收集木头",
+      conversationId: "plugin:minecraft-bot",
+      channel: "minecraft",
+    });
+    expect(result.options.soulRuntimeContext).toContain("[plugin-agent] minecraft");
   });
 
   it("keeps chat tool-free when enhancement switch is off", async () => {
@@ -377,7 +441,8 @@ describe("build-options", () => {
       conversationId: "chat-a",
       query: "message-13",
     })
-    expect(result.options.messages).toHaveLength(12)
+    // CTA Phase 1：社交开关只影响检索块，不再截断模型历史
+    expect(result.options.messages).toHaveLength(14)
     expect(result.options.soulRuntimeContext).toContain("用户喜欢海边")
     expect(result.options.socialContext).toMatchObject({
       enabled: true,
@@ -625,6 +690,7 @@ describe("build-options", () => {
     const deps = createBuildDeps()
     deps.loadModelSettings = () => ({
       provider: "test", baseUrl: "https://example.test", model: "text-only", apiKey: "k", multimodal: false,
+      vision: { baseUrl: "https://vlm.test/v1", apiKey: "k", model: "vlm-model" },
     })
     deps.captionImageForFallback = async () => ({ ok: true, caption: "截图显示一个红色错误提示" })
 
@@ -638,6 +704,24 @@ describe("build-options", () => {
       "这张图报什么错？\n\n【图片视觉信息】\n以下内容是视觉模型对用户本轮图片的观察结果，请将其视为你已经看到的图片内容；如果某张图分析失败，请不要编造。\n- error.png：截图显示一个红色错误提示",
     )
     expect(result.options.imageCaptionFallback).toBeUndefined()
+  })
+
+  it("纯文本主模型且未配视觉模型时注入人话拒绝提示（不再静默丢图）", async () => {
+    const deps = createBuildDeps()
+    deps.loadModelSettings = () => ({
+      provider: "test", baseUrl: "https://example.test", model: "text-only", apiKey: "k", multimodal: false,
+    })
+
+    const result = await buildAgentRunOptions({
+      messages: [{ role: "user", content: "这张图报什么错？" }],
+      imageAttachments: [{ name: "error.png", filePath: "C:\\tmp\\error.png", mime: "image/png" }],
+    }, deps)
+
+    const latestUser = result.options.messages.at(-1)
+    expect(latestUser?.content).toContain("【图片发送失败】")
+    expect(latestUser?.content).toContain("error.png")
+    expect(latestUser?.content).toContain("视觉模型")
+    expect(latestUser?.content).not.toContain("image_url")
   })
 
   it("builds caption fallback messages for direct image send failures", async () => {
@@ -720,9 +804,8 @@ describe("build-options", () => {
       runtimeState: { status: "陪伴中", feeling: "温柔", expression: 0, updatedAt: 0 },
       feelingToExpression: { "温柔": 0 },
       setRuntimeState: () => {},
-      stickerEmbeddingIndex: null,
-      getEmbeddingProvider: () => null,
-      matchSticker: async () => null,
+      stickerTextIndex: [],
+      matchSticker: () => null,
       loadStickerSettings: () => ({}),
       broadcastRuntimeStateChanged: () => {},
       observeRuntimeState: async () => {},
@@ -739,10 +822,10 @@ describe("build-options", () => {
     })
   })
 
-  it("uses the latest sticker embedding index when agent run finishes", async () => {
-    const matchSticker = vi.fn(async () => ({ id: "hugtight" }))
-    const latestIndex = [{ id: "hugtight", embedding: [1, 0] }]
-    const deps: OnRunFinishedDeps & { getStickerEmbeddingIndex: () => unknown } = {
+  it("uses the latest sticker text index when agent run finishes", async () => {
+    const matchSticker = vi.fn(() => ({ id: "hugtight" }))
+    const latestIndex = [{ id: "hugtight", text: "抱抱你 拥抱 安慰" }]
+    const deps: OnRunFinishedDeps & { getStickerTextIndex: () => typeof latestIndex } = {
       loadModelSettings: () => ({
         provider: "test",
         baseUrl: "",
@@ -757,9 +840,8 @@ describe("build-options", () => {
       runtimeState: { status: "陪伴中", feeling: "温柔", expression: 0, updatedAt: 0 },
       feelingToExpression: { "温柔": 0 },
       setRuntimeState: () => {},
-      stickerEmbeddingIndex: null,
-      getStickerEmbeddingIndex: () => latestIndex,
-      getEmbeddingProvider: () => ({ embed: async () => [1, 0] }),
+      stickerTextIndex: [],
+      getStickerTextIndex: () => latestIndex,
       matchSticker,
       loadStickerSettings: () => ({}),
       broadcastRuntimeStateChanged: () => {},
@@ -771,17 +853,16 @@ describe("build-options", () => {
 
     expect(matchSticker).toHaveBeenCalledWith(
       "来，抱抱你\n今天好累",
-      expect.anything(),
       latestIndex,
       0.55,
     )
     expect(effects).toEqual({ sticker: "hugtight" })
   })
 
-  it("does not send document model context into memory or sticker embedding side effects", async () => {
+  it("does not send document model context into memory or sticker matching side effects", async () => {
     const scheduleMemoryWrite = vi.fn()
-    const matchSticker = vi.fn(async () => null)
-    const latestIndex = [{ id: "thinking", embedding: [1, 0] }]
+    const matchSticker = vi.fn(() => null)
+    const latestIndex = [{ id: "thinking", text: "思考 理解 分析" }]
     const hugeDoc = "超长文档内容".repeat(1000)
     const latestUserText = [
       "帮我总结这个 md",
@@ -803,8 +884,7 @@ describe("build-options", () => {
       runtimeState: { status: "陪伴中", feeling: "温柔", expression: 0, updatedAt: 0 },
       feelingToExpression: { "温柔": 0 },
       setRuntimeState: () => {},
-      stickerEmbeddingIndex: latestIndex,
-      getEmbeddingProvider: () => ({ embed: async () => [1, 0] }),
+      stickerTextIndex: latestIndex,
       matchSticker,
       loadStickerSettings: () => ({}),
       broadcastRuntimeStateChanged: () => {},
@@ -812,19 +892,66 @@ describe("build-options", () => {
       recordRelationshipTurn: async () => {},
     }
 
-    await onAgentRunFinished({ reply: "总结好了", toolResults: [] }, latestUserText, deps)
+    await onAgentRunFinished({ reply: "总结好了", toolResults: [] }, latestUserText, deps, undefined, "c1",
+      { vectorMemorySource: { userTurnId: "u1", assistantEntryId: "a1" } })
 
-    expect(scheduleMemoryWrite).toHaveBeenCalledWith("帮我总结这个 md", "总结好了", undefined)
+    expect(scheduleMemoryWrite).toHaveBeenCalledWith("帮我总结这个 md", "总结好了", "c1", { userTurnId: "u1", assistantEntryId: "a1" })
     expect(matchSticker).toHaveBeenCalledWith(
       "总结好了\n帮我总结这个 md",
-      expect.anything(),
       latestIndex,
       0.55,
     )
   })
 
-  it("skips sticker embedding when reply and user content contain only code or math", async () => {
-    const matchSticker = vi.fn(async () => ({ id: "hugtight" }))
+  it.each(["off", "summary", "wiki"] as const)("keeps %s dispatch unchanged with vector provenance", async (memoryMode) => {
+    const scheduleMemoryWrite = vi.fn()
+    const scheduleSummaryTurn = vi.fn()
+    const scheduleWikiTurn = vi.fn()
+    const deps: OnRunFinishedDeps = {
+      loadModelSettings: () => ({
+        provider: "test",
+        baseUrl: "",
+        model: "",
+        apiKey: "",
+        runtimeSync: "off",
+        memoryMode,
+      }),
+      scheduleMemoryWrite,
+      scheduleSummaryTurn,
+      scheduleWikiTurn,
+      inferRuntimeState: () => ({ status: "陪伴中" }),
+      runtimeState: { status: "陪伴中", feeling: "温柔", expression: 0, updatedAt: 0 },
+      feelingToExpression: { "温柔": 0 },
+      setRuntimeState: () => {},
+      stickerTextIndex: [],
+      matchSticker: () => null,
+      loadStickerSettings: () => ({}),
+      broadcastRuntimeStateChanged: () => {},
+      observeRuntimeState: async () => {},
+      recordRelationshipTurn: async () => {},
+    }
+
+    await onAgentRunFinished(
+      { reply: "记住了", toolResults: [] },
+      "记住这个信息",
+      deps,
+      undefined,
+      "conversation-a",
+      { assistantEntryId: "assistant-a", userTurnId: "user-a",
+        vectorMemorySource: { userTurnId: "vector-user", assistantEntryId: "vector-reply" } },
+    )
+
+    expect(scheduleMemoryWrite).not.toHaveBeenCalled()
+    expect(scheduleSummaryTurn).toHaveBeenCalledTimes(memoryMode === "summary" ? 1 : 0)
+    expect(scheduleWikiTurn).toHaveBeenCalledTimes(memoryMode === "wiki" ? 1 : 0)
+    if (memoryMode === "summary") expect(scheduleSummaryTurn).toHaveBeenCalledWith({
+      conversationId: "conversation-a", assistantEntryId: "assistant-a", userTurnId: "user-a",
+      userText: "记住这个信息", assistantText: "记住了",
+    })
+  })
+
+  it("skips sticker matching when reply and user content contain only code or math", async () => {
+    const matchSticker = vi.fn(() => ({ id: "hugtight" }))
     const deps: OnRunFinishedDeps = {
       loadModelSettings: () => ({ provider: "test", baseUrl: "", model: "", apiKey: "", runtimeSync: "off", stickerEnabled: true }),
       scheduleMemoryWrite: () => {},
@@ -832,8 +959,7 @@ describe("build-options", () => {
       runtimeState: { status: "陪伴中", feeling: "温柔", expression: 0, updatedAt: 0 },
       feelingToExpression: { "温柔": 0 },
       setRuntimeState: () => {},
-      stickerEmbeddingIndex: [{ id: "hugtight", embedding: [1, 0] }],
-      getEmbeddingProvider: () => ({ embed: async () => [1, 0] }),
+      stickerTextIndex: [{ id: "hugtight", text: "抱抱你" }],
       matchSticker,
       loadStickerSettings: () => ({}),
       broadcastRuntimeStateChanged: () => {},
@@ -863,9 +989,8 @@ describe("build-options", () => {
       runtimeState: { status: "陪伴中", feeling: "温柔", expression: 0, updatedAt: 0 },
       feelingToExpression: { "温柔": 0 },
       setRuntimeState: () => {},
-      stickerEmbeddingIndex: null,
-      getEmbeddingProvider: () => null,
-      matchSticker: async () => null,
+      stickerTextIndex: [],
+      matchSticker: () => null,
       loadStickerSettings: () => ({}),
       broadcastRuntimeStateChanged: () => {},
       observeRuntimeState,
@@ -896,6 +1021,180 @@ describe("build-options", () => {
       retrievedAtoms,
       now: 100,
     })
+  })
+
+  it("#26 sessionModelSettings 直达请求装配：会话模型不被 loadModelSettings 重解析覆盖", async () => {
+    const deps = createBuildDeps()
+    deps.loadModelSettings = vi.fn(() => ({
+      provider: "test", baseUrl: "https://example.test", model: "profile-default", apiKey: "k",
+    }))
+
+    const result = await buildAgentRunOptions({
+      sessionId: "session-override",
+      messages: [{ role: "user", content: "你好" }],
+      // 即便同时携带 modelProfileId，也不允许 downstream 据此把会话模型覆盖回档案默认
+      modelProfileId: "p-a",
+      sessionModelSettings: {
+        provider: "test", baseUrl: "https://example.test", model: "glm-session", apiKey: "k",
+      },
+    }, deps)
+
+    expect(result.options.settings.model).toBe("glm-session")
+    expect(deps.loadModelSettings).not.toHaveBeenCalled()
+  })
+
+  it("不传 sessionModelSettings 时按 modelProfileId 解析（非桌面入口回退路径不变）", async () => {
+    const deps = createBuildDeps()
+    deps.loadModelSettings = vi.fn((modelProfileId?: string) => ({
+      provider: "test", baseUrl: "https://example.test", model: `by-profile:${modelProfileId}`, apiKey: "k",
+    }))
+
+    const result = await buildAgentRunOptions({
+      sessionId: "channel-run",
+      messages: [{ role: "user", content: "你好" }],
+      modelProfileId: "p-b",
+    }, deps)
+
+    expect(deps.loadModelSettings).toHaveBeenCalledWith("p-b")
+    expect(result.options.settings.model).toBe("by-profile:p-b")
+  })
+})
+
+describe("本轮图片附件回归", () => {
+  const tempDirs: string[] = []
+
+  afterEach(() => {
+    for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true })
+    tempDirs.length = 0
+  })
+
+  function createImageInput() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyrene-current-image-"))
+    tempDirs.push(dir)
+    const image = { name: "current.png", filePath: path.join(dir, "current.png"), mime: "image/png" }
+    fs.writeFileSync(image.filePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+    return {
+      image,
+      input: {
+        sessionId: "current-image-session",
+        mode: "chat",
+        executionMode: "chat",
+        currentUser: {
+          turnId: "current-image-turn", text: "请看这张图", visibleContent: "请看这张图",
+          attachments: [{ kind: "image", ...image }],
+        },
+        modelContext: {
+          messages: [{ role: "user", content: "请看这张图" }],
+          uncertainEffects: [], throughSeq: 1,
+        },
+      },
+    }
+  }
+
+  function imageBlocks(content: unknown) {
+    return Array.isArray(content) ? content.filter((block) => block.type === "image_url") : []
+  }
+
+  it.each([false, true])("本轮图片去重后直发，新旧字段同时存在=%s", async (withLegacy) => {
+    const { input, image } = createImageInput()
+    input.currentUser.attachments.push(
+      { kind: "image", ...image, filePath: path.dirname(image.filePath) + path.sep + "." + path.sep + image.name },
+      { kind: "document", ...image, name: "document.png" },
+    )
+    const result = await buildAgentRunOptions({
+      ...input,
+      ...(withLegacy ? { imageAttachments: [image] } : {}),
+    }, createBuildDeps())
+
+    const expected = [{ type: "image_url", image_url: { url: expect.stringMatching(/^data:image\/png;base64,/) } }]
+    expect(imageBlocks(result.options.messages.at(-1)?.content)).toEqual(expected)
+    expect(imageBlocks(result.options.cleanMessages?.at(-1)?.content)).toEqual(expected)
+    expect(JSON.stringify(result.options.messages)).toContain("【本轮附件路径】")
+  })
+
+  it("转述优先消费本轮图片，排除文档和旧字段中的其它图片", async () => {
+    const { input, image } = createImageInput()
+    input.currentUser.attachments.push({ kind: "document", ...image, name: "notes.png" })
+    const deps = createBuildDeps()
+    deps.loadModelSettings = () => ({
+      provider: "test", baseUrl: "https://example.test", model: "text-only", apiKey: "k", multimodal: false,
+      vision: { baseUrl: "https://vlm.test/v1", apiKey: "k", model: "vlm-model" },
+    })
+    deps.captionImageForFallback = vi.fn(async () => ({ ok: true, caption: "图片中有红色错误提示" }))
+    const result = await buildAgentRunOptions({
+      ...input,
+      imageAttachments: [image, { name: "stale.png", filePath: path.join(path.dirname(image.filePath), "stale.png") }],
+    }, deps)
+
+    expect(deps.captionImageForFallback).toHaveBeenCalledWith(image.filePath)
+    expect(deps.captionImageForFallback).toHaveBeenCalledTimes(2)
+    expect(result.options.messages.at(-1)?.content).toContain("current.png：图片中有红色错误提示")
+    expect(result.options.cleanMessages?.at(-1)?.content).toContain("current.png：图片中有红色错误提示")
+    expect(result.options.messages.at(-1)?.content).not.toContain("stale.png")
+    expect(result.options.imageCaptionFallback).toBeUndefined()
+  })
+
+  it("本轮图片直发失败后仍能生成转述降级消息", async () => {
+    const { input, image } = createImageInput()
+    const deps = createBuildDeps()
+    deps.captionImageForFallback = vi.fn(async () => ({ ok: true, caption: "画面是一张安装截图" }))
+    const result = await buildAgentRunOptions(input, deps)
+    expect(result.options.imageCaptionFallback).toBeDefined()
+
+    const fallback = await result.options.imageCaptionFallback!()
+    expect(deps.captionImageForFallback).toHaveBeenCalledWith(image.filePath)
+    expect(fallback.at(-1)?.content).toContain("current.png：画面是一张安装截图")
+    expect(imageBlocks(fallback.at(-1)?.content)).toHaveLength(0)
+  })
+
+  it("本轮图片无可用视觉路由时显示拒绝原因", async () => {
+    const { input } = createImageInput()
+    const deps = createBuildDeps()
+    deps.loadModelSettings = () => ({
+      provider: "test", baseUrl: "https://example.test", model: "text-only", apiKey: "k", multimodal: false,
+    })
+    const result = await buildAgentRunOptions(input, deps)
+    expect(result.options.messages.at(-1)?.content).toContain("【图片发送失败】")
+    expect(result.options.messages.at(-1)?.content).toContain("current.png")
+    expect(result.options.cleanMessages?.at(-1)?.content).toContain("【图片发送失败】")
+  })
+
+  it.each([undefined, " "])("本轮只有文档或无效图片时回退旧图片字段，路径=%s", async (filePath) => {
+    const { input, image } = createImageInput()
+    const result = await buildAgentRunOptions({
+      ...input,
+      currentUser: {
+        ...input.currentUser,
+        attachments: [
+          { kind: "document", ...image, name: "notes.png" },
+          { kind: "image", ...image, filePath },
+        ],
+      },
+      imageAttachments: [image],
+    }, createBuildDeps())
+    expect(imageBlocks(result.options.messages.at(-1)?.content)).toHaveLength(1)
+  })
+
+  it("渠道旧图片字段也按文件路径去重", async () => {
+    const { image } = createImageInput()
+    const result = await buildAgentRunOptions({
+      messages: [{ role: "user", content: "渠道图片" }],
+      imageAttachments: [image, { ...image, name: "duplicate.png" }],
+    }, createBuildDeps())
+    expect(imageBlocks(result.options.messages.at(-1)?.content)).toHaveLength(1)
+  })
+
+  it("文档和网页元素附件不会被读成图片", async () => {
+    const { input, image } = createImageInput()
+    const result = await buildAgentRunOptions({
+      ...input,
+      currentUser: {
+        ...input.currentUser,
+        attachments: [{ kind: "document", ...image }, { kind: "web-element", name: "selected-element" }],
+      },
+    }, createBuildDeps())
+    expect(imageBlocks(result.options.messages.at(-1)?.content)).toHaveLength(0)
+    expect(result.options.imageCaptionFallback).toBeUndefined()
   })
 })
 
@@ -988,5 +1287,199 @@ describe("moments context 注入（Phase 3 Chat Awareness）", () => {
 
     expect(result.options.soulRuntimeContext).not.toContain("【近期朋友圈动态】")
     expect(result.options.soulRuntimeContext).not.toMatch(/(^|\n)---(\n|$)\s*(^|\n)---/)
+  })
+})
+
+describe("权威轨迹上下文源（CTA Phase 1）", () => {
+  it("desktop transcript context 启用时忽略渲染端消息", async () => {
+    const deps = createBuildDeps()
+    deps.buildModelContext = vi.fn(async () => ({
+      messages: [{ role: "user" as const, content: "authoritative" }],
+      uncertainEffects: [],
+      throughSeq: 3,
+    }))
+
+    const built = await buildAgentRunOptions({
+      sessionId: "c1",
+      currentUser: { turnId: "turn-1", text: "next", visibleContent: "next" },
+      messages: [{ role: "user" as const, content: "stale renderer" }],
+    } as never, deps)
+
+    expect(deps.buildModelContext).toHaveBeenCalledWith("c1", expect.any(Number))
+    expect(built.options.cleanMessages).toContainEqual(expect.objectContaining({ content: "authoritative" }))
+    expect(JSON.stringify(built.options.messages)).not.toContain("stale renderer")
+    expect(built.latestUserText).toBe("authoritative")
+  })
+
+  it("渠道与内部调用方不触发轨迹上下文，继续使用传入消息", async () => {
+    const deps = createBuildDeps()
+    deps.buildModelContext = vi.fn(async () => ({
+      messages: [],
+      uncertainEffects: [],
+      throughSeq: 0,
+    }))
+
+    const built = await buildAgentRunOptions({
+      sessionId: "channel-binding",
+      messages: [{ role: "user" as const, content: "channel text" }],
+    } as never, deps)
+
+    expect(deps.buildModelContext).not.toHaveBeenCalled()
+    expect(built.latestUserText).toBe("channel text")
+    expect(built.options.cleanMessages).toContainEqual(expect.objectContaining({ content: "channel text" }))
+  })
+
+  it("缺失 buildModelContext 注入时轨迹上下文请求 fail-closed", async () => {
+    const deps = createBuildDeps()
+    await expect(buildAgentRunOptions({
+      sessionId: "missing-dep",
+      currentUser: { turnId: "turn-1", text: "hi", visibleContent: "hi" },
+      messages: [{ role: "user" as const, content: "hi" }],
+    } as never, deps)).rejects.toThrow("buildModelContext")
+  })
+
+  it("完整活动视图超预算时先提交会话级 compaction，再重新物化上下文", async () => {
+    const deps = createBuildDeps()
+    deps.loadModelSettings = () => ({
+      provider: "test", baseUrl: "https://example.test", model: "m", apiKey: "k",
+      contextWindowTokens: 10_000,
+    })
+    const full = [{ role: "user" as const, content: "历史".repeat(2_000) }]
+    const compacted = [{ role: "system" as const, content: "<cyrene_compaction_checkpoint>\n摘要\n</cyrene_compaction_checkpoint>" }]
+    let reads = 0
+    deps.buildModelContext = vi.fn(async () => ({
+      messages: reads++ === 0 ? full : compacted,
+      uncertainEffects: [], throughSeq: 8,
+    }))
+    deps.compactTranscript = vi.fn(async () => ({ checkpointEntryId: "cp-1" }))
+
+    const built = await buildAgentRunOptions({
+      sessionId: "auto-compact", currentUser: { turnId: "turn-1", text: "继续", visibleContent: "继续" },
+    } as never, deps)
+
+    expect(deps.compactTranscript).toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: "auto-compact", trigger: "automatic", retainTokens: expect.any(Number),
+    }))
+    expect(deps.buildModelContext).toHaveBeenCalledTimes(2)
+    expect(built.options.cleanMessages).toContainEqual(expect.objectContaining({ content: expect.stringContaining("<cyrene_compaction_checkpoint>") }))
+  })
+
+  it("传入 modelContext 超预算时同样执行自动压缩并重读 journal", async () => {
+    const deps = createBuildDeps()
+    deps.loadModelSettings = () => ({
+      provider: "test", baseUrl: "https://example.test", model: "m", apiKey: "k",
+      contextWindowTokens: 10_000,
+    })
+    const compacted = [{ role: "system" as const, content: "<cyrene_compaction_checkpoint>\n摘要\n</cyrene_compaction_checkpoint>" }]
+    deps.buildModelContext = vi.fn(async () => ({
+      messages: compacted, uncertainEffects: [], throughSeq: 8,
+    }))
+    deps.compactTranscript = vi.fn(async () => ({ checkpointEntryId: "cp-1" }))
+
+    const built = await buildAgentRunOptions({
+      sessionId: "prebuilt-compact",
+      currentUser: { turnId: "turn-1", text: "继续", visibleContent: "继续" },
+      // 模拟桌面/渠道入口预传入的超长上下文
+      modelContext: {
+        messages: [{ role: "user" as const, content: "历史".repeat(2_000) }],
+        uncertainEffects: [], throughSeq: 8,
+      },
+    } as never, deps)
+
+    expect(deps.compactTranscript).toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: "prebuilt-compact", trigger: "automatic", retainTokens: expect.any(Number),
+    }))
+    // 压缩后只发生一次重读（初始上下文来自传入值）
+    expect(deps.buildModelContext).toHaveBeenCalledTimes(1)
+    expect(built.options.cleanMessages).toContainEqual(expect.objectContaining({ content: expect.stringContaining("<cyrene_compaction_checkpoint>") }))
+  })
+
+  it("自动 compaction 摘要失败时对外只报告 TRANSCRIPT_COMPACTION_REQUIRED", async () => {
+    const deps = createBuildDeps()
+    deps.loadModelSettings = () => ({
+      provider: "test", baseUrl: "https://example.test", model: "m", apiKey: "k", contextWindowTokens: 100,
+    })
+    deps.buildModelContext = vi.fn(async () => ({
+      messages: [{ role: "user" as const, content: "历史".repeat(300) }], uncertainEffects: [], throughSeq: 8,
+    }))
+    deps.compactTranscript = vi.fn(async () => { throw new Error("provider down") })
+
+    await expect(buildAgentRunOptions({
+      sessionId: "auto-compact-failure",
+      currentUser: { turnId: "turn-1", text: "继续", visibleContent: "继续" },
+    } as never, deps)).rejects.toThrow("TRANSCRIPT_COMPACTION_REQUIRED")
+  })
+
+  it("轮次内压缩入口绑定当前会话模型并重读已提交摘要", async () => {
+    const deps = createBuildDeps()
+    const selected = { provider: "current", baseUrl: "https://current.test", model: "selected-model", apiKey: "k", contextWindowTokens: 128_000 }
+    let compressed = false
+    deps.buildModelContext = vi.fn(async () => ({
+      messages: [{ role: "user" as const, content: compressed ? "已提交摘要" : "当前问题" }],
+      uncertainEffects: [], throughSeq: 8,
+    }))
+    deps.compactTranscript = vi.fn(async () => { compressed = true })
+    const built = await buildAgentRunOptions({
+      sessionId: "active-model", sessionModelSettings: selected,
+      currentUser: { turnId: "turn-1", text: "当前问题", visibleContent: "当前问题" },
+    } as never, deps)
+    const signal = new AbortController().signal
+    const messages = await built.options.compactTranscript!({ retainTokens: 20_000, transientMessages: [], signal })
+    expect(deps.compactTranscript).toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: "active-model", trigger: "automatic", modelSettings: selected, retainTokens: 20_000, signal,
+    }))
+    expect(messages).toEqual([{ role: "user", content: "已提交摘要" }])
+  })
+
+  it("崩溃孤儿不确定效果并入 recoveryContext", async () => {
+    const deps = createBuildDeps()
+    deps.buildModelContext = vi.fn(async () => ({
+      messages: [{ role: "user" as const, content: "authoritative" }],
+      uncertainEffects: [{
+        id: "run-1:call-1",
+        toolCallId: "call-1",
+        fingerprint: "send_email:abc",
+        toolName: "send_email",
+        message: "该外部副作用在应用中断时尚未确认结果",
+      }],
+      throughSeq: 5,
+    }))
+
+    const built = await buildAgentRunOptions({
+      sessionId: "uncertain",
+      currentUser: { turnId: "turn-1", text: "继续", visibleContent: "继续" },
+      messages: [{ role: "user" as const, content: "继续" }],
+    } as never, deps)
+
+    expect(built.options.recoveryContext).toContain("send_email")
+    expect(built.options.recoveryContext).toContain("不得自动重放")
+  })
+
+  it("开启社交上下文不再截断模型历史（slice(-12) 已废除）", async () => {
+    const deps = createBuildDeps()
+    deps.buildChatSocialContext = vi.fn(async () => ({ contextBlock: "SOCIAL", retrievedAtoms: [] }))
+    const messages = Array.from({ length: 16 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" as const : "assistant" as const,
+      content: `消息${index}`,
+    }))
+
+    const built = await buildAgentRunOptions({
+      sessionId: "social-no-truncate",
+      executionMode: "chat",
+      userTurnId: "turn-8",
+      assistantTurnId: "turn-7",
+      messages,
+    } as never, {
+      ...deps,
+      loadGeneralSettings: () => ({
+        ...deps.loadGeneralSettings(),
+        chatSocialContextEnabled: true,
+      }),
+    })
+
+    // 16 条消息全部进入模型上下文，社交开关只影响检索块不再影响历史
+    expect(built.options.cleanMessages).toHaveLength(16)
+    expect(JSON.stringify(built.options.messages)).toContain("消息0")
+    expect(JSON.stringify(built.options.messages)).toContain("消息15")
   })
 })

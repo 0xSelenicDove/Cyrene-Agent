@@ -3,13 +3,23 @@
 // 协议事实来源：docs/vendors/tool-calling-matrix.md
 
 import type { ReasoningPreference } from "../../../shared/reasoning";
+import type { ManualReasoningConfig } from "../../../shared/manual-reasoning";
 import type { PromptLayerMetadata } from "../prompt-layers";
+import type { ProviderCapability, Transport } from "../../../shared/vendor-registry/types";
+import type { AssistantContent } from "ai";
+import type { GeneratedImageOutput } from "../../../shared/generated-image";
+import type { GeneratedImageAttachment } from "../../../shared/generated-image";
 
-export type Transport = "openai" | "anthropic" | "responses";
-export type AuthStyle = "bearer" | "x-api-key";
-export type ThinkingField = "reasoning_content" | "thinking" | "reasoning_details" | null;
-export type CacheStrategy = "prompt_cache_key" | "cache_control" | "auto" | "none";
-export type TestStrategy = "text" | "text+tool";
+// 厂商能力系类型已迁入 shared/vendor-registry/types（厂商注册表的类型事实源）；
+// 此处 re-export 保持既有 import 路径（./types）不变，调用方零改动。
+export type {
+  Transport,
+  AuthStyle,
+  ThinkingField,
+  CacheStrategy,
+  TestStrategy,
+  ProviderCapability,
+} from "../../../shared/vendor-registry/types";
 
 /** 调度层传入适配器的厂商运行时配置（结构兼容 main/index.ts 的 ModelSettings）。 */
 export interface VendorConfig {
@@ -27,6 +37,10 @@ export interface VendorConfig {
    * commit 2 落地后由 ModelSettings 顶层镜像字段填充；commit 1 期间为可选。
    */
   reasoning?: ReasoningPreference;
+  /** 当前模型在档案中显式配置的推理规则。 */
+  manualReasoning?: ManualReasoningConfig;
+  /** 仅主会话调用使用；摘要等辅助请求不读取此配置。 */
+  imageGeneration?: { enabled: boolean; model: string };
 }
 
 export type OpenAIContentBlock =
@@ -42,10 +56,27 @@ export interface ToolCall {
   arguments: string; // JSON 字符串，沿用 OpenAI 习惯
 }
 
+/** 只在来源完全匹配时回放；摘要和跨模型请求使用通用消息内容。 */
+export interface ModelMessageOrigin {
+  transport: Transport;
+  provider: string;
+  model: string;
+  /** 规范化端点的摘要，不保存含认证参数的地址。 */
+  endpoint: string;
+  /** 高熵凭证的摘要；换账号或密钥后不继续回放旧签名。 */
+  credentialScope: string;
+}
+
+export interface ProviderReplay {
+  version: 1;
+  origin: ModelMessageOrigin;
+  /** SDK 规范化后的有序内容；与通用内容分开持久化，升级时可独立迁移。 */
+  content: Exclude<AssistantContent, string>;
+}
+
 /**
- * 统一消息结构。两个 transport 各自只读自己需要的字段，调度层透传。
- * - OpenAI transport 读 content / toolCalls / toolCallId / name
- * - Anthropic transport 额外读 thinking / rawAssistant（多轮必须原样回传 content block 数组）
+ * 通用正文和工具语义是历史事实来源；调度层透传带来源的重放补充数据。
+ * 模型执行入口和旧适配器按目标来源投影请求；新版私有内容只在来源匹配时回传。
  */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -57,8 +88,11 @@ export interface ChatMessage {
   name?: string;
   /** 思考/推理纯文本（reasoning_content / thinking block 抽出来）。 */
   thinking?: string;
-  /** Anthropic 多轮必须原样回传 assistant.content block 数组；OpenAI transport 不读。 */
+  /** 旧历史兼容输入。无来源原始数据不得直接发送给厂商。 */
   rawAssistant?: unknown;
+  providerReplay?: ProviderReplay;
+  /** 已落盘的模型生成图片引用；编码数据不得出现在此字段。 */
+  attachments?: GeneratedImageAttachment[];
   /** 仅供本地 transcript / UI 使用；Adapter 序列化时不得发送。 */
   visibility?: "user" | "internal";
   /** 仅供本地持久化和去重使用；Adapter 序列化时不得发送。 */
@@ -121,6 +155,8 @@ export interface ChatRequest {
   extraBody?: Record<string, unknown>;
   /** 仅供本地缓存键与诊断使用，Adapter 不得将该字段直接发给厂商。 */
   promptLayers?: PromptLayerMetadata;
+  /** 仅主会话可设置；摘要、标题等辅助请求保持缺省关闭。 */
+  imageGeneration?: { enabled: boolean; model: string };
 }
 
 /**
@@ -173,6 +209,8 @@ export interface ChatResponse {
   /** API 返回的 token 用量（OpenAI: prompt_tokens/completion_tokens；Anthropic: input_tokens/output_tokens）。
    *  未上报时为 undefined，由调用方兜底。 */
   usage?: { input: number; output: number; cachedInput?: number; cacheCreation?: number };
+  /** 主进程临时数据，提交到权威轨迹前必须先落盘并剥离编码。 */
+  generatedImages?: GeneratedImageOutput[];
 }
 
 export interface HttpRequest {
@@ -192,51 +230,6 @@ export interface TestConnectionResult {
   latency: number;
   sample?: string;
   error?: string;
-}
-
-/**
- * 厂商能力表的一条记录。是 vendor adapter 的"事实来源"，
- * 避免调度层散落 if (provider === "kimi")。
- */
-export interface ProviderCapability {
-  id: string;
-  displayName: string;
-  transport: Transport;
-  baseUrl: string;
-  authStyle: AuthStyle;
-  /** Anthropic-compatible endpoints sometimes require a different auth header. */
-  anthropicAuthStyle?: AuthStyle;
-  defaultModel: string;
-  supportsTools: boolean;
-  supportsThinking: boolean;
-  thinkingField: ThinkingField;
-  cacheStrategy: CacheStrategy;
-  testStrategy: TestStrategy;
-  /** 是否支持视觉（图片）输入。非多模态模型禁止走 read_image。 */
-  supportsVision: boolean;
-  /** Supported must-call wire policies; Adapter maps required to OpenAI required / Anthropic any. */
-  toolChoiceModes?: ReadonlyArray<"named" | "required" | "auto" | "omit">;
-  /**
-   * 该厂商支持的协议清单（来自 docs/vendors 协议矩阵）。
-   * 仅用于新建档案时预填默认值 + UI 提示文案，**不拦截**用户在下拉框的选择——
-   * 用户填什么协议就走什么协议（自定义端点/中转站自行负责兼容性）。
-   * 不标 = 未核实，UI 按"仅 capability.transport"提示。
-   */
-  supportedTransports?: readonly Transport[];
-  /**
-   * Responses transport：端点是否按 OpenAI 官方语义支持
-   * `include: ["reasoning.encrypted_content"]`（store:false 下多轮回放加密 reasoning）。
-   * capability 标记只是必要条件；运行时还需 baseUrl 为 OpenAI 官方域名（api.openai.com）
-   * 才真正下发 include——中转站/第三方兼容端不发，避免报参数错误。
-   */
-  responsesEncryptedReasoning?: boolean;
-  /**
-   * 视觉模型的 OpenAI 兼容 baseUrl。仅当主聊天走 Anthropic 入口、视觉需走 OpenAI 入口时才需要标
-   * （如 MiniMax 主配 /anthropic，视觉要走 /v1）。不标 = 视觉用主配置 baseUrl。
-   */
-  visionBaseUrl?: string;
-  /** UI 是否允许选择（Claude 等 Anthropic adapter 未就绪前先禁用）。 */
-  disabled?: boolean;
 }
 
 /** 调度层只看到这一层接口。 */

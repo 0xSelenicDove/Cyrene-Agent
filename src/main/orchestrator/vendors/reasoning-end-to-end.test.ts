@@ -10,8 +10,11 @@
 import { describe, expect, test } from "vitest";
 import { OpenAICompatAdapter } from "./openai-adapter";
 import { AnthropicAdapter } from "./anthropic-adapter";
+import { ResponsesAdapter } from "./responses-adapter";
+import { getCapabilityOrOpenAI } from "./capabilities";
 import type { ProviderCapability, VendorConfig } from "./types";
 import type { ReasoningPreference } from "../../../shared/reasoning";
+import type { ManualReasoningConfig } from "../../../shared/manual-reasoning";
 
 const chatgptCap: ProviderCapability = {
   id: "chatgpt",
@@ -25,7 +28,6 @@ const chatgptCap: ProviderCapability = {
   thinkingField: "reasoning_content",
   cacheStrategy: "auto",
   testStrategy: "text",
-  supportsVision: false,
 };
 
 const claudeCap: ProviderCapability = {
@@ -40,8 +42,21 @@ const claudeCap: ProviderCapability = {
   thinkingField: "thinking",
   cacheStrategy: "cache_control",
   testStrategy: "text",
-  supportsVision: true,
   disabled: true,
+};
+
+const geminiCap: ProviderCapability = {
+  id: "gemini",
+  displayName: "Gemini（Google）",
+  transport: "openai",
+  baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+  authStyle: "bearer",
+  defaultModel: "gemini-3.8-flash",
+  supportsTools: true,
+  supportsThinking: true,
+  thinkingField: "reasoning_content",
+  cacheStrategy: "auto",
+  testStrategy: "text",
 };
 
 const mimoCap: ProviderCapability = {
@@ -56,9 +71,22 @@ const mimoCap: ProviderCapability = {
   thinkingField: "reasoning_content",
   cacheStrategy: "auto",
   testStrategy: "text",
-  supportsVision: true,
   visionBaseUrl: "https://api.xiaomimimo.com/v1",
 };
+
+test("豆包托管 glm-5.3 的实际请求保留强制思考与 high 档位", () => {
+  const cap = getCapabilityOrOpenAI("豆包（火山方舟）");
+  const adapter = new OpenAICompatAdapter("doubao", cap);
+  const model = "glm-5.3";
+  const http = adapter.buildRequest(
+    { model, messages: [{ role: "user", content: "hi" }] },
+    cfgOf(cap, { model, reasoning: { mode: "off" } }),
+  );
+  const body = JSON.parse(http.body);
+  expect(body.thinking).toEqual({ type: "enabled" });
+  expect(body.reasoning_effort).toBe("high");
+  expect(body.enable_thinking).toBeUndefined();
+});
 
 function cfgOf(
   cap: ProviderCapability,
@@ -73,6 +101,47 @@ function cfgOf(
   };
 }
 
+describe("手动推理规则进入实际请求", () => {
+  const manual: ManualReasoningConfig = {
+    style: "openai-effort", supportedEfforts: ["low", "high"], defaultEffort: "high", supportsDisable: true,
+  };
+  const request = { model: "custom-unknown-model", messages: [{ role: "user" as const, content: "hi" }] };
+
+  test("未知模型的 OpenAI 兼容请求发送所选强度", () => {
+    const adapter = new OpenAICompatAdapter("chatgpt", chatgptCap);
+    const http = adapter.buildRequest(request, {
+      ...cfgOf(chatgptCap, { model: request.model, reasoning: { mode: "on", effort: "high" } }),
+      manualReasoning: manual,
+    });
+    expect(JSON.parse(http.body).reasoning_effort).toBe("high");
+  });
+
+  test("未知模型的 Responses 请求使用嵌套推理字段", () => {
+    const adapter = new ResponsesAdapter("chatgpt", chatgptCap);
+    const http = adapter.buildRequest(request, {
+      ...cfgOf(chatgptCap, { model: request.model, reasoning: { mode: "on", effort: "high" } }),
+      manualReasoning: manual,
+    });
+    expect(JSON.parse(http.body).reasoning).toEqual({ effort: "high" });
+  });
+
+  test("自定义片段在协议转换后进入 Responses 请求", () => {
+    const adapter = new ResponsesAdapter("chatgpt", chatgptCap);
+    const http = adapter.buildRequest(request, {
+      ...cfgOf(chatgptCap, { model: request.model, reasoning: { mode: "on", effort: "max" } }),
+      manualReasoning: {
+        style: "custom", supportedEfforts: ["high", "max"], defaultEffort: "high", supportsDisable: true,
+        customBodies: {
+          high: { reasoning: { effort: "high" } },
+          max: { reasoning: { effort: "max" } },
+          off: { reasoning: { effort: "none" } },
+        },
+      },
+    });
+    expect(JSON.parse(http.body).reasoning).toEqual({ effort: "max" });
+  });
+});
+
 describe("G1 OpenAI chatgpt + reasoning 透传", () => {
   const adapter = new OpenAICompatAdapter("chatgpt", chatgptCap);
 
@@ -85,13 +154,13 @@ describe("G1 OpenAI chatgpt + reasoning 透传", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
-  test("gpt-5.6 + reasoning=auto → body 中无 reasoning_effort", () => {
+  test("gpt-5.6 + 旧 auto 偏好 → body.reasoning_effort=medium", () => {
     const http = adapter.buildRequest(
       { model: "gpt-5.6", messages: [{ role: "user", content: "hi" }] },
       cfgOf(chatgptCap, { model: "gpt-5.6", reasoning: { mode: "auto" } }),
     );
     const body = JSON.parse(http.body) as Record<string, unknown>;
-    expect("reasoning_effort" in body).toBe(false);
+    expect(body.reasoning_effort).toBe("medium");
   });
 
   test("gpt-4o + reasoning=auto → body 中无 reasoning_effort（非推理模型）", () => {
@@ -116,10 +185,69 @@ describe("G2 Claude + reasoning 透传", () => {
     expect((body.output_config as Record<string, unknown>).effort).toBe("xhigh");
     expect((body.thinking as Record<string, unknown>).type).toBe("adaptive");
   });
+
+  // Claude Haiku 5.5 官方约束（核验 2026-10-08）：只接受自适应思考；关闭思考仅在 high 及以下合法，
+  // xhigh/max 下关闭返回 400。下面验证实际请求体满足这些约束。
+  const haikuBody = (reasoning?: ReasoningPreference) => {
+    const http = adapter.buildRequest(
+      { model: "claude-haiku-5-5", messages: [{ role: "user", content: "hi" }], maxTokens: 100 },
+      cfgOf(claudeCap, { model: "claude-haiku-5-5", ...(reasoning ? { reasoning } : {}) }),
+    );
+    return JSON.parse(http.body) as Record<string, unknown>;
+  };
+
+  test("claude-haiku-5-5 + {mode:'on', effort:'max'} → 自适应思考且发送所选档位", () => {
+    const body = haikuBody({ mode: "on", effort: "max" });
+    expect(body.thinking).toEqual({ type: "adaptive" });
+    expect((body.output_config as Record<string, unknown>).effort).toBe("max");
+  });
+
+  test("claude-haiku-5-5 未设置档位 → 自适应思考 + 默认 medium，不发 budget_tokens", () => {
+    const body = haikuBody();
+    expect(body.thinking).toEqual({ type: "adaptive" });
+    expect((body.output_config as Record<string, unknown>).effort).toBe("medium");
+  });
+
+  test("claude-haiku-5-5 + off → thinking.disabled 且不带 effort（避免 xhigh/max 下关闭的 400）", () => {
+    const body = haikuBody({ mode: "off" });
+    expect(body.thinking).toEqual({ type: "disabled" });
+    expect((body.output_config as Record<string, unknown> | undefined)?.effort).toBeUndefined();
+  });
 });
 
-describe("G3 reasoning=undefined（视为 auto）", () => {
-  test("mimo mimo-v2.5-pro + reasoning=undefined → body 中无 thinking", () => {
+describe("gemini-4-argon 请求体", () => {
+  const adapter = new OpenAICompatAdapter("gemini", geminiCap);
+  // 官方：thinking_level 仅 low/medium/high，默认 medium；兼容层 reasoning_effort 映射 thinking_level，
+  // "none" 关闭思考只写明适用于 2.5 系。下面验证实际请求体不越出这些档位、也不发送采样参数。
+  const argonBody = (reasoning?: ReasoningPreference) => {
+    const http = adapter.buildRequest(
+      { model: "gemini-4-argon", messages: [{ role: "user", content: "hi" }] },
+      cfgOf(geminiCap, { model: "gemini-4-argon", ...(reasoning ? { reasoning } : {}) }),
+    );
+    return JSON.parse(http.body) as Record<string, unknown>;
+  };
+
+  test("gemini-4-argon + {mode:'on', effort:'high'} → reasoning_effort=high", () => {
+    expect(argonBody({ mode: "on", effort: "high" }).reasoning_effort).toBe("high");
+  });
+
+  test("gemini-4-argon 未设置档位 → reasoning_effort=medium，且不发 temperature", () => {
+    const body = argonBody();
+    expect(body.reasoning_effort).toBe("medium");
+    expect("temperature" in body).toBe(false);
+  });
+
+  test("gemini-4-argon + off → 不发送 none（Gemini 4 未写明可关闭），回到默认 medium", () => {
+    expect(argonBody({ mode: "off" }).reasoning_effort).toBe("medium");
+  });
+
+  test("gemini-4-argon + 不支持的 max → 收敛到默认 medium", () => {
+    expect(argonBody({ mode: "on", effort: "max" }).reasoning_effort).toBe("medium");
+  });
+});
+
+describe("G3 reasoning=undefined（使用滑块默认档）", () => {
+  test("mimo mimo-v2.5-pro + reasoning=undefined → 开启 thinking", () => {
     const adapter = new OpenAICompatAdapter("mimo", mimoCap);
     const cfg: VendorConfig = {
       provider: mimoCap.displayName,
@@ -133,13 +261,13 @@ describe("G3 reasoning=undefined（视为 auto）", () => {
       cfg,
     );
     const body = JSON.parse(http.body) as Record<string, unknown>;
-    expect("thinking" in body).toBe(false);
+    expect(body.thinking).toEqual({ type: "enabled" });
     expect("enable_thinking" in body).toBe(false);
   });
 });
 
 describe("G4 cfg.reasoning 改动 → JSON body 改动（契约：adapter 必须读 cfg.reasoning）", () => {
-  test("MiniMax-M3 auto vs off → body.thinking.type 不同", () => {
+  test("MiniMax-M3 旧 auto 落滑块默认关闭，on 与 off 明确发送", () => {
     const miniMaxCap: ProviderCapability = {
       id: "minimax",
       displayName: "MiniMax（稀宇科技）",
@@ -152,7 +280,6 @@ describe("G4 cfg.reasoning 改动 → JSON body 改动（契约：adapter 必须
       thinkingField: "thinking",
       cacheStrategy: "cache_control",
       testStrategy: "text",
-      supportsVision: true,
       visionBaseUrl: "https://api.minimaxi.com/v1",
     };
     const adapter = new AnthropicAdapter("minimax", miniMaxCap);
@@ -173,8 +300,8 @@ describe("G4 cfg.reasoning 改动 → JSON body 改动（契约：adapter 必须
     const bodyOn = JSON.parse(httpOn.body) as Record<string, unknown>;
     const bodyOff = JSON.parse(httpOff.body) as Record<string, unknown>;
 
-    // auto 不发 thinking
-    expect("thinking" in bodyAuto).toBe(false);
+    // 旧 auto 落到统一产品默认关闭
+    expect((bodyAuto.thinking as Record<string, unknown>).type).toBe("disabled");
     // on 发 adaptive
     expect((bodyOn.thinking as Record<string, unknown>).type).toBe("adaptive");
     // off 发 disabled
@@ -194,7 +321,6 @@ describe("G4 cfg.reasoning 改动 → JSON body 改动（契约：adapter 必须
       thinkingField: "reasoning_content",
       cacheStrategy: "auto",
       testStrategy: "text",
-      supportsVision: false,
     };
     const adapter = new OpenAICompatAdapter("deepseek", dsCap);
 
@@ -229,7 +355,6 @@ describe("G5 5+ 关键 capability 形态端到端", () => {
       thinkingField: "thinking",
       cacheStrategy: "prompt_cache_key",
       testStrategy: "text",
-      supportsVision: true,
     };
     const adapter = new OpenAICompatAdapter("kimi", kimiCap);
     const http = adapter.buildRequest(
@@ -253,7 +378,6 @@ describe("G5 5+ 关键 capability 形态端到端", () => {
       thinkingField: "thinking",
       cacheStrategy: "prompt_cache_key",
       testStrategy: "text",
-      supportsVision: true,
     };
     const adapter = new OpenAICompatAdapter("kimi", kimiCap);
     const http = adapter.buildRequest(
@@ -281,7 +405,6 @@ describe("G5 5+ 关键 capability 形态端到端", () => {
       thinkingField: "reasoning_content",
       cacheStrategy: "auto",
       testStrategy: "text",
-      supportsVision: false,
     };
     const adapter = new OpenAICompatAdapter("qwen", qwenCap);
     const http = adapter.buildRequest(
@@ -306,7 +429,6 @@ describe("G5 5+ 关键 capability 形态端到端", () => {
       thinkingField: "reasoning_content",
       cacheStrategy: "none",
       testStrategy: "text",
-      supportsVision: true,
     };
     const adapter = new OpenAICompatAdapter("doubao", doubaoCap);
     const http = adapter.buildRequest(

@@ -1,6 +1,7 @@
 import type { AsrConfig } from "./asr-config";
 import { MosslandAsrStream } from "./mossland-asr-engine";
-import { VolcanoAsrStream } from "./volcano-asr-engine";
+import { MiniMaxAsrStream } from "./minimax-asr-engine";
+import { AliyunAsrStream } from "./aliyun-asr-engine";
 
 export interface AsrStreamSession {
   start(): Promise<void>;
@@ -16,8 +17,11 @@ export function createAsrStream(
   if (config.engine === "mossland") {
     return new MosslandAsrStream(config.apiKey, onFinal);
   }
+  if (config.engine === "minimax") {
+    return new MiniMaxAsrStream(config.apiKey, onFinal);
+  }
 
-  const stream = new VolcanoAsrStream(onPartial, onFinal);
+  const stream = new AliyunAsrStream(onPartial, onFinal);
   return {
     start: () => stream.start(
       config.appKey,

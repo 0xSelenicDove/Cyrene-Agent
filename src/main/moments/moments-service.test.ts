@@ -33,7 +33,7 @@ const mocks = vi.hoisted(() => ({
   loadGeneralSettings: vi.fn(),
   loadModelSettings: vi.fn(),
   loadPromptFile: vi.fn(),
-  getEmbeddingProvider: vi.fn(),
+  loadStickerSettings: vi.fn(() => ({})),
   getPermanentWorldbookEntries: vi.fn(),
   getKeywordMatchedWorldbookEntries: vi.fn(),
   validateCaptionImagePath: vi.fn(),
@@ -42,13 +42,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../llm-queue", () => ({ enqueueLLMTask: mocks.enqueueLLMTask }));
 vi.mock("../settings/settings-facade", () => ({ loadGeneralSettings: mocks.loadGeneralSettings }));
 vi.mock("../settings/model-settings", () => ({ loadModelSettings: mocks.loadModelSettings }));
-vi.mock("../rag/embedding", () => ({
-  getEmbeddingProvider: mocks.getEmbeddingProvider,
-  getEmbeddingProviderIdentity: async () => ({ provider: "local", model: "test", dimensions: 2 }),
-}));
+vi.mock("../orchestrator/sticker-settings", () => ({ loadStickerSettings: mocks.loadStickerSettings }));
 // sticker-storage 引 electron，且 resolveMomentStickerMedia 要读用户贴图 manifest——mock 掉
 vi.mock("../sticker-storage", () => ({
-  loadUserStickerManifest: () => ({ "my-cat": { file: "my-cat.png" } }),
+  loadUserStickerManifest: () => ({ "my-cat": { file: "my-cat.png", description: "猫猫", phrases: ["看看猫猫"] } }),
 }));
 vi.mock("../prompts/prompt-loader", () => ({ loadPromptFile: mocks.loadPromptFile }));
 vi.mock("../orchestrator/vendors", () => ({ getAdapterForConfig: vi.fn() }));
@@ -78,7 +75,6 @@ import {
   createMomentsMediaMatcher,
   createMomentsService,
   loadUserMomentPostImages,
-  registerMomentsMediaMatcher,
   type MomentsTurnInput,
 } from "./moments-service";
 
@@ -1583,27 +1579,15 @@ describe("moments service 配图接线", () => {
 });
 
 describe("createMomentsMediaMatcher 具体闭包", () => {
-  /** 查询向量恒为 [1,0]，与贴图向量算余弦便于构造精确分数 */
-  const provider = {
-    name: "test-provider",
-    dims: 2,
-    embed: async () => [1, 0],
-    embedBatch: async (texts: string[]) => texts.map(() => [1, 0] as number[]),
-  };
-
   beforeEach(() => {
-    mocks.getEmbeddingProvider.mockReset();
     mocks.loadModelSettings.mockReset();
-    // 复位晚绑定索引：避免上一条用例注册的索引泄漏到下一条
-    registerMomentsMediaMatcher({ getStickerIndex: () => null });
+    mocks.loadStickerSettings.mockReset().mockReturnValue({});
   });
 
-  it("provider 与贴图索引就绪且达阈值时产出内置贴图媒体", async () => {
-    mocks.getEmbeddingProvider.mockReturnValue(provider);
-    registerMomentsMediaMatcher({ getStickerIndex: () => [{ id: "sleepynow", embedding: [1, 0] }] });
+  it("文本明确匹配内置贴图时产出贴图媒体", async () => {
     mocks.loadModelSettings.mockReturnValue({ stickerSimilarityThreshold: 0.55 });
 
-    const media = await createMomentsMediaMatcher()("深夜好困");
+    const media = await createMomentsMediaMatcher()("困了，想睡觉");
 
     expect(media).toEqual({
       id: "media_sticker_sleepynow",
@@ -1614,8 +1598,6 @@ describe("createMomentsMediaMatcher 具体闭包", () => {
   });
 
   it("命中用户贴图时产出 local-sticker 媒体引用", async () => {
-    mocks.getEmbeddingProvider.mockReturnValue(provider);
-    registerMomentsMediaMatcher({ getStickerIndex: () => [{ id: "my-cat", embedding: [1, 0] }] });
     mocks.loadModelSettings.mockReturnValue({ stickerSimilarityThreshold: 0.55 });
 
     const media = await createMomentsMediaMatcher()("看看猫猫");
@@ -1628,24 +1610,15 @@ describe("createMomentsMediaMatcher 具体闭包", () => {
     });
   });
 
-  it("embedding provider 未就绪时降级 null", async () => {
-    registerMomentsMediaMatcher({ getStickerIndex: () => [{ id: "sleepynow", embedding: [1, 0] }] });
-
-    expect(await createMomentsMediaMatcher()("深夜")).toBeNull();
-  });
-
-  it("贴图索引未注册 / 未就绪时降级 null", async () => {
-    mocks.getEmbeddingProvider.mockReturnValue(provider);
-
-    expect(await createMomentsMediaMatcher()("深夜")).toBeNull();
-  });
-
-  it("最高分低于设置阈值时降级 null", async () => {
-    mocks.getEmbeddingProvider.mockReturnValue(provider);
-    registerMomentsMediaMatcher({ getStickerIndex: () => [{ id: "sleepynow", embedding: [0, 1] }] });
+  it("没有明确文本匹配时降级纯文字", async () => {
     mocks.loadModelSettings.mockReturnValue({ stickerSimilarityThreshold: 0.55 });
+    expect(await createMomentsMediaMatcher()("天气怎么样")).toBeNull();
+  });
 
-    expect(await createMomentsMediaMatcher()("深夜")).toBeNull();
+  it("禁用的贴图不参与候选排序", async () => {
+    mocks.loadStickerSettings.mockReturnValue({ sleepynow: false });
+    mocks.loadModelSettings.mockReturnValue({ stickerSimilarityThreshold: 0.55 });
+    expect(await createMomentsMediaMatcher()("困了，想睡觉")).toBeNull();
   });
 });
 
@@ -1709,8 +1682,23 @@ describe("moments worldbook 注入与图片读取", () => {
       expect(mocks.validateCaptionImagePath).not.toHaveBeenCalled();
     });
 
-    it("multimodal=false 时不读图（与主会话同一条开关规矩）", () => {
+    it("纯文本主模型未配视觉模型时给出人话错误而非静默丢图", () => {
       mocks.loadModelSettings.mockReturnValue({ multimodal: false });
+
+      const images = loadUserMomentPostImages(makePost({
+        media: [{ id: "m1", type: "image", origin: "user_attachment", ref: "1.jpg" }],
+      }));
+
+      expect(images).toHaveLength(1);
+      expect(images[0].error).toContain("视觉模型");
+      expect(mocks.validateCaptionImagePath).not.toHaveBeenCalled();
+    });
+
+    it("纯文本主模型已配视觉模型时不带图（moments 只直发不转述，维持现状）", () => {
+      mocks.loadModelSettings.mockReturnValue({
+        multimodal: false,
+        vision: { baseUrl: "https://api.vlm.example.com/v1", apiKey: "k", model: "vlm" },
+      });
 
       const images = loadUserMomentPostImages(makePost({
         media: [{ id: "m1", type: "image", origin: "user_attachment", ref: "1.jpg" }],
@@ -1718,6 +1706,16 @@ describe("moments worldbook 注入与图片读取", () => {
 
       expect(images).toEqual([]);
       expect(mocks.validateCaptionImagePath).not.toHaveBeenCalled();
+    });
+
+    it("reject 时无 user_attachment 配图则不产生提示噪音", () => {
+      mocks.loadModelSettings.mockReturnValue({ multimodal: false });
+
+      const images = loadUserMomentPostImages(makePost({
+        media: [{ id: "m1", type: "image", origin: "character_asset", ref: "stickers/peek.gif" }],
+      }));
+
+      expect(images).toEqual([]);
     });
   });
   it("注入链路：反应调用携带 worldbook 与图片进 prompt", async () => {

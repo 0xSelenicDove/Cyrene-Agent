@@ -16,13 +16,10 @@ import { setChoiceCardSender, setChoiceDismissSender } from "../user-choice";
 import { setAsrConfig } from "../asr/asr-config";
 import { setCallSettings } from "../call/call-manager";
 import { buildCallSystemPrompt } from "../call/call-prompt-builder";
-import type { SceneIndex } from "../scene-embedder";
 import { reactChatWindow } from "../windows/window-state";
 
 export interface BootstrapConfigContext {
   loadGeneralSettings: () => GeneralSettings;
-  /** 场景嵌入索引 getter，用于通话语气注入。 */
-  getSceneEmbeddingIndex: () => SceneIndex | null;
 }
 
 function getReactChatWindow(): BrowserWindow | null {
@@ -47,20 +44,6 @@ export function bootstrapConfigGetters(ctx: BootstrapConfigContext): void {
     () => loadUserProfile().defaultCity,
     () => loadGeneralSettings().weatherSource,
     () => loadGeneralSettings().amapKey,
-    // 天气卡片回调：工具拿到结构化数据后，发 Custom 事件给 react 聊天窗口渲染卡片
-    (card, context) => {
-      const win = getReactChatWindow();
-      if (win) {
-        win.webContents.send(IPC.AGUI_EVENT, {
-          type: "CUSTOM",
-          name: "cyrene.weather",
-          value: card,
-          // 天气工具在 Harness 内执行时必须归属到该 run；否则 renderer 的
-          // RunEventGate 会把没有 runId 的卡片事件当作串会话事件丢弃。
-          ...(context?.runId ? { runId: context.runId } : {}),
-        });
-      }
-    },
     () => loadGeneralSettings().weatherEnabled,
   );
 
@@ -68,13 +51,14 @@ export function bootstrapConfigGetters(ctx: BootstrapConfigContext): void {
   setUserTimezoneConfig(() => loadUserProfile().timezone);
 
   // 注入用户选择卡片回调：工具调 ask_user_choice 时发 Custom 事件给 react 聊天窗口
-  setChoiceCardSender((cardData) => {
+  setChoiceCardSender((cardData, runId) => {
     const win = getReactChatWindow();
     if (win) {
       win.webContents.send(IPC.AGUI_EVENT, {
         type: "CUSTOM",
         name: "cyrene.choice",
         value: cardData,
+        ...(runId ? { runId } : {}),
       });
     }
   });
@@ -88,6 +72,7 @@ export function bootstrapConfigGetters(ctx: BootstrapConfigContext): void {
         type: "CUSTOM",
         name: "cyrene.choice.dismiss",
         value: settlement,
+        ...(settlement.runId ? { runId: settlement.runId } : {}),
       });
     }
   });
@@ -119,6 +104,9 @@ export function bootstrapConfigGetters(ctx: BootstrapConfigContext): void {
     const s = loadGeneralSettings();
     if (s.asrEngine === "mossland") {
       return { engine: "mossland", apiKey: s.ttsMosslandKey };
+    }
+    if (s.asrEngine === "minimax") {
+      return { engine: "minimax", apiKey: s.asrMinimaxKey };
     }
     if (s.asrEngine === "aliyun") {
       return { engine: "aliyun", appKey: s.asrAliyunAppKey, accessKeyId: s.asrAliyunAccessKeyId, accessKeySecret: s.asrAliyunAccessKeySecret, language: s.asrLanguage };
@@ -160,11 +148,7 @@ export function bootstrapConfigGetters(ctx: BootstrapConfigContext): void {
     // 通话专用 system prompt 构建器
     async (userText: string) => {
       const messages = [{ role: "user" as const, content: userText }];
-      return buildCallSystemPrompt(
-        { sceneEmbeddingIndex: ctx.getSceneEmbeddingIndex() },
-        userText,
-        messages,
-      );
+      return buildCallSystemPrompt(userText, messages);
     },
     // 天气快捷处理：正则匹配到天气关键词 → 调 weather 工具的 execute
     async (userText: string) => {

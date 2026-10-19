@@ -7,8 +7,12 @@ import {
 describe("resolveStructuredOutputProfile", () => {
   test.each([
     ["chatgpt", "gpt-6-astra", "openai", "provider_json_schema"],
+    ["chatgpt", "gpt-6-sol", "openai", "provider_json_schema"],
+    ["chatgpt", "gpt-6-luna", "openai", "provider_json_schema"],
     ["chatgpt", "gpt-5.6", "openai", "provider_json_schema"],
     ["claude", "claude-sonnet-4-6", "anthropic", "provider_json_schema"],
+    ["claude", "claude-haiku-5-5", "anthropic", "provider_json_schema"],
+    ["gemini", "gemini-4-argon", "openai", "provider_json_schema"],
     ["kimi", "kimi-k3", "openai", "provider_json_schema"],
     ["kimi", "kimi-for-coding", "openai", "provider_json_schema"],
     ["doubao", "doubao-seed-2-1-pro-260628", "openai", "provider_json_schema"],
@@ -19,6 +23,7 @@ describe("resolveStructuredOutputProfile", () => {
     ["glm", "glm-5.2", "openai", "provider_json_object"],
     ["glm", "glm-5.1", "openai", "provider_json_object"],
     ["mimo", "mimo-v2.5-pro", "openai", "provider_json_object"],
+    ["mimo", "mimo-v2.6-pro", "openai", "provider_json_object"],
     ["minimax", "MiniMax-M3", "openai", "prompt_json"],
   ] as const)("%s/%s resolves to %s", (provider, model, transport, mode) => {
     expect(resolveStructuredOutputProfile({
@@ -27,6 +32,17 @@ describe("resolveStructuredOutputProfile", () => {
       transport,
       endpointKind: "official",
     }).mode).toBe(mode);
+  });
+
+  test("Gemini 4 Argon rule matches only the verified model name", () => {
+    for (const model of ["gemini-3.8-flash", "gemini-4-argon-preview", "gemini-4-flash"]) {
+      expect(resolveStructuredOutputProfile({
+        provider: "gemini",
+        model,
+        transport: "openai",
+        endpointKind: "official",
+      }).mode).toBe("prompt_json");
+    }
   });
 
   test("custom and local endpoints are permanently prompt_json", () => {

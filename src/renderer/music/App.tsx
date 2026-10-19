@@ -137,6 +137,27 @@ function makeCachePlaylist(tracks: Track[]): Playlist {
   };
 }
 
+// ── mpv 内核缺失判定：player 不可用且原因是二进制找不到/spawn 失败 ──
+function isMpvKernelMissing(
+  snap: { player?: string; playerErrorCode?: string } | undefined | null,
+): boolean {
+  return (
+    snap?.player === "unavailable" &&
+    (snap?.playerErrorCode === "E_MPV_NOT_FOUND" || snap?.playerErrorCode === "E_MPV_SPAWN_FAILED")
+  );
+}
+
+// mpv 内核缺失提示条：只提示安装方式，不阻断浏览/搜索（issue #98）
+function MpvKernelWarning() {
+  return (
+    <div className="mp-kernel-warning" role="alert">
+      <span>
+        未找到 mpv 播放器内核，暂时无法播放。请运行 <code>pnpm run prepare:mpv</code> 或安装 mpv 后重启应用
+      </span>
+    </div>
+  );
+}
+
 // ── 播放模式：普通歌单双模式，缓存歌单四模式，localStorage 分开持久化 ──
 const ONLINE_MODES: PlaybackMode[] = ["off", "one"];
 const CACHE_MODES: PlaybackMode[] = ["off", "all", "one", "shuffle"];
@@ -176,6 +197,8 @@ export function App() {
   const [neteasePlaylists, setNeteasePlaylists] = useState<Playlist[]>([]);
   const [cacheTracks, setCacheTracks] = useState<Track[]>([]);
   const [activePlaylistId, setActivePlaylistId] = useState("");
+  const playlistLoadSeq = useRef(0);
+  const [failedPlaylist, setFailedPlaylist] = useState<Playlist | null>(null);
   // 同步网易云歌单最新值给 onStateChanged 回调用，避免闭包陷阱导致重复拉取
   const neteasePlaylistsRef = useRef<Playlist[]>([]);
   const [searchResults, setSearchResults] = useState<Track[]>([]);
@@ -185,6 +208,8 @@ export function App() {
   // 自动选源必须等它，否则本地曲库会抢占默认歌单（本地 IPC 比网络快）。
   const [neteaseResolved, setNeteaseResolved] = useState(false);
   const [loading, setLoading] = useState(true);
+  // mpv 内核缺失（未安装 / spawn 失败）→ 顶部显示安装引导提示条
+  const [kernelMissing, setKernelMissing] = useState(false);
   const searchTimer = useRef<number | null>(null);
   // 记住静音前的音量，用于取消静音时恢复
   const volumeBeforeMute = useRef<number>(70);
@@ -410,7 +435,8 @@ export function App() {
         // 「只导入了本地音乐、没登录网易云」的用户会看到一个空播放器。
         void loadCacheTracks();
         const r = await api.getStatus();
-        const snap = r.data as { account?: string; backend?: string };
+        const snap = r.data as { account?: string; backend?: string; player?: string; playerErrorCode?: string };
+        setKernelMissing(isMpvKernelMissing(snap));
         if (snap?.account === "signed_in") {
           setLoginReady(true);
           // 已登录：等歌单真正拉回来才算有结论
@@ -426,7 +452,9 @@ export function App() {
     };
     void checkLogin();
     const unsub = api.onStateChanged?.((raw) => {
-      const snap = raw as { account?: string };
+      const snap = raw as { account?: string; player?: string; playerErrorCode?: string };
+      // mpv 失败后重试成功（比如用户补装了 mpv）→ 撤掉提示条
+      setKernelMissing(isMpvKernelMissing(snap));
       void loadCacheTracks();
       if (snap?.account === "signed_in") {
         setLoginReady(true);
@@ -456,7 +484,6 @@ export function App() {
         setNeteasePlaylists(pls);
         neteasePlaylistsRef.current = pls;
         if (pls.length > 0 && !activePlaylistId) {
-          setActivePlaylistId(pls[0].id);
           // 自动加载第一个歌单的 tracks 作为初始 queue
           void loadPlaylistTracks(pls[0]);
         }
@@ -512,11 +539,22 @@ export function App() {
     });
   }, [activePlaylistId, cacheTracks]);
 
+  // ── 切歌单时模式随歌单类型切换 ──────────────────────────────
+  const applyModeForPlaylist = useCallback((playlistId: string) => {
+    const mode =
+      playlistId === LOCAL_CACHE_PLAYLIST_ID ? persistedCacheRef.current : persistedOnlineRef.current;
+    setState((s) => (s.playbackMode === mode ? s : { ...s, playbackMode: mode }));
+  }, []);
+
   const loadPlaylistTracks = useCallback(
     async (playlist: Playlist) => {
       if (!api) return;
+      const seq = ++playlistLoadSeq.current;
+      setFailedPlaylist(null);
       // 缓存歌单：tracks 已在内存（cacheTracks 快照），不调 API
       if (playlist.id === LOCAL_CACHE_PLAYLIST_ID) {
+        setActivePlaylistId(playlist.id);
+        applyModeForPlaylist(playlist.id);
         setState((s) => ({
           ...s,
           queue: playlist.tracks,
@@ -531,9 +569,12 @@ export function App() {
       }
       try {
         const r = await api.getPlaylistDetail(playlist.id);
+        if (seq !== playlistLoadSeq.current) return;
         if (r.ok && r.data) {
           const detail = r.data as BackendPlaylist;
           const tracks = (detail.tracks ?? []).map(normalizeTrack);
+          setActivePlaylistId(playlist.id);
+          applyModeForPlaylist(playlist.id);
           setState((s) => ({
             ...s,
             queue: tracks,
@@ -544,17 +585,23 @@ export function App() {
             isPlaying: false,
             error: undefined,
           }));
+        } else {
+          setFailedPlaylist(playlist);
         }
       } catch (err) {
+        if (seq !== playlistLoadSeq.current) return;
         console.warn("[music] getPlaylistDetail failed", err);
+        setFailedPlaylist(playlist);
       }
     },
-    [api],
+    [api, applyModeForPlaylist],
   );
 
   // ── 播放指定歌曲（本地 queue 管理 + IPC 派发） ──────────────
   const playTrack = useCallback(
     (track: Track) => {
+      // 新的主动播放操作优先于此前失败的歌单加载；后台播放事件不清除此提示。
+      setFailedPlaylist(null);
       endedRef.current = false;
       if (!track.visible) {
         patch({ error: `「${track.name}」暂时无法播放` });
@@ -616,13 +663,6 @@ export function App() {
     if (s.queue.length === 0) return -1;
     if (s.queueIndex <= 0) return s.playbackMode === "all" ? s.queue.length - 1 : 0;
     return s.queueIndex - 1;
-  }, []);
-
-  // ── 切歌单时模式随歌单类型切换 ──────────────────────────────
-  const applyModeForPlaylist = useCallback((playlistId: string) => {
-    const mode =
-      playlistId === LOCAL_CACHE_PLAYLIST_ID ? persistedCacheRef.current : persistedOnlineRef.current;
-    setState((s) => (s.playbackMode === mode ? s : { ...s, playbackMode: mode }));
   }, []);
 
   // ── actions（MusicPlayer 组件消费） ──────────────────────────
@@ -730,8 +770,6 @@ export function App() {
         });
       },
       loadPlaylist(playlist) {
-        applyModeForPlaylist(playlist.id);
-        setActivePlaylistId(playlist.id);
         void loadPlaylistTracks(playlist);
       },
       cycleMode() {
@@ -771,7 +809,7 @@ export function App() {
         void api.toggleFavorite(track.encryptedId, newFav).catch(() => { /* ignore */ });
       },
     }),
-    [api, state, patch, playTrack, computeNextIndex, computePrevIndex, loadPlaylistTracks, activePlaylistId, applyModeForPlaylist],
+    [api, state, patch, playTrack, computeNextIndex, computePrevIndex, loadPlaylistTracks, activePlaylistId],
   );
 
   // ── 搜索（250ms 防抖） ──────────────────────────────────────
@@ -857,13 +895,17 @@ export function App() {
   if (!canOpenPlayer({ neteaseSignedIn: loginReady, localTrackCount: cacheTracks.length })) {
     return (
       <div className="mp-shell">
-        <div className="mp-window-chrome">
-          <button type="button" className="win-btn" onClick={minimizeWindow} title="最小化"><Minus size={14} /></button>
-          <button type="button" className="win-btn win-btn--close" onClick={closeWindow} title="关闭"><X size={14} /></button>
-        </div>
+        {kernelMissing && <MpvKernelWarning />}
         <div className="mp-not-ready">
           <p>还没有可播放的音乐</p>
           <p className="mp-not-ready-hint">在「设置 → 插件 → 音乐工具」里导入本地音乐，或扫码登录网易云</p>
+        </div>
+        {/* 窗口按钮必须排在整屏 drag 区域之后：Electron 按文档顺序合成拖拽区域，
+            后出现的 no-drag 才能从前面的 drag 里扣掉，否则按钮会被当成标题栏、点了没反应。
+            按钮是绝对定位，挪到后面不影响显示位置。 */}
+        <div className="mp-window-chrome">
+          <button type="button" className="win-btn" onClick={minimizeWindow} title="最小化"><Minus size={14} /></button>
+          <button type="button" className="win-btn win-btn--close" onClick={closeWindow} title="关闭"><X size={14} /></button>
         </div>
       </div>
     );
@@ -875,8 +917,13 @@ export function App() {
         <button type="button" className="win-btn" onClick={minimizeWindow} title="最小化"><Minus size={14} /></button>
         <button type="button" className="win-btn win-btn--close" onClick={closeWindow} title="关闭"><X size={14} /></button>
       </div>
+      {kernelMissing && <MpvKernelWarning />}
       <MusicPlayer
         state={state}
+        playlistLoadError={failedPlaylist ? {
+          message: "歌单加载失败，请稍后重试",
+          onRetry: () => { void loadPlaylistTracks(failedPlaylist); },
+        } : undefined}
         actions={actions}
         playlists={playlists}
         activePlaylistId={activePlaylistId}

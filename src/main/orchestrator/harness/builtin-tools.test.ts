@@ -3,6 +3,7 @@ import {
   askUserToolSpec,
   executeAskUser,
   executeConfirmUncertainEffect,
+  formatAskUserPreview,
   updateTodoToolSpec,
   executeUpdateTodo,
   taskToolSpec,
@@ -44,7 +45,7 @@ describe("Harness user-wait builtins", () => {
     expect(taskToolSpec.name).toBe("task");
     expect(JSON.stringify(taskToolSpec.parameters)).toContain("companion_id");
     expect(taskToolSpec.description).toContain("黄金裔");
-    expect(executor).toHaveBeenCalledWith({ description: "检查取消链路", prompt: "检查取消传播并给出证据", subagentType: "general", companionId: "风堇", taskId: undefined });
+    expect(executor).toHaveBeenCalledWith({ description: "检查取消链路", prompt: "检查取消传播并给出证据", subagentType: "general", companionId: "风堇", taskId: undefined, accessMode: "write", maxParallelToolCalls: 4 });
     expect(result.output).toContain("task-1");
     expect(result.message).not.toContain("检查取消传播");
   });
@@ -192,6 +193,48 @@ describe("Harness user-wait builtins", () => {
     expect(result.message).toContain("系统提示：用户未在时限内回答问题");
   });
 
+  it("formats answered questions as readable preview rows for the tool card", () => {
+    const preview = formatAskUserPreview(
+      {
+        questions: [
+          { id: "db", question: "使用哪个数据库？", type: "single_select", options: [] },
+          { id: "env", question: "部署到哪个环境？", type: "single_select", options: [] },
+          { id: "note", question: "补充说明？", type: "text" },
+        ],
+      },
+      {
+        outcome: "success",
+        tool: "ask_user",
+        message: "用户已回答 3 个问题",
+        output: JSON.stringify({
+          answers: [
+            { questionId: "db", selectedValues: ["pg"], selectedLabels: ["PostgreSQL"] },
+            { questionId: "env", selectedLabels: ["测试环境"] },
+            { questionId: "note", customInput: "先跑灰度" },
+          ],
+        }),
+      },
+    );
+
+    expect(preview).toEqual([
+      "使用哪个数据库？ → PostgreSQL",
+      "部署到哪个环境？ → 测试环境",
+      "补充说明？ → 先跑灰度",
+    ]);
+  });
+
+  it("marks unanswered questions in the preview and falls back to the message on failure", () => {
+    expect(formatAskUserPreview(
+      { questions: [{ id: "db", question: "使用哪个数据库？", type: "single_select", options: [] }] },
+      { outcome: "success", tool: "ask_user", message: "用户已回答 0 个问题", output: JSON.stringify({ answers: [] }) },
+    )).toEqual(["使用哪个数据库？ → 未回答"]);
+
+    expect(formatAskUserPreview(
+      { questions: [{ id: "db", question: "使用哪个数据库？", type: "single_select", options: [] }] },
+      { outcome: "failure", tool: "ask_user", message: "用户回答超时或失败：超时" },
+    )).toBe("用户回答超时或失败：超时");
+  });
+
   it("describes update_todo as a mutable notebook for multi-step tool work", () => {
     expect(updateTodoToolSpec.description).toContain("至少 2 个 execution step");
     expect(updateTodoToolSpec.description).toContain("tool round");
@@ -291,7 +334,10 @@ describe("Harness user-wait builtins", () => {
     }, state, request);
 
     expect(result.outcome).toBe("success");
-    expect(state.uncertainEffects).toEqual([]);
+    expect(state.uncertainEffects[0]?.repeatAuthorization).toMatchObject({
+      id: "effect-1:repeat",
+      source: "user",
+    });
   });
 
   it("keeps the effect unresolved when the user does not authorize", async () => {

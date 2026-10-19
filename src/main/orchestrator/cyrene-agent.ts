@@ -39,6 +39,7 @@ export interface AgentLoopResult {
   toolResults: import("./types").ToolCallResult[];
   completionReason: "no_tool" | "timeout" | "max_rounds" | "tool_error";
   totalUsage?: { input: number; output: number };
+  modelFailure?: import("../../shared/model-error").ModelFailureInfo;
   /**
    * Canonical 终态结算（exactly-once，见 run-settlement.ts）。
    * 由 harness-adapter 根据 HarnessResult.terminateReason 填充；
@@ -59,11 +60,13 @@ export interface AgentLoopEvent {
   stepName?: string;
   totalUsage?: unknown;
   content?: string;
-  status?: string;
+  status?: string | import("../../shared/model-retry").ModelRetryStatus;
   snapshot?: unknown;
   taskPlan?: unknown;
   /** 上下文容量快照（chat-loop 发射；type 为 "context_usage"）。 */
   contextUsage?: import("../../shared/context-usage").ContextUsageSnapshot;
+  attachments?: import("../../shared/generated-image").GeneratedImageAttachment[];
+  roundId?: string;
 }
 
 import type { SocialAtom } from "../social-context/types";
@@ -85,8 +88,12 @@ export interface AgentLoopSettings {
   apiKey: string;
   explicitTransport?: "openai" | "anthropic" | "responses" | "auto";
   reasoning?: import("../../shared/reasoning").ReasoningPreference;
+  manualReasoning?: import("../../shared/manual-reasoning").ManualReasoningConfig;
+  imageGeneration?: { enabled: boolean; model: string };
   /** 用户设置的模型上下文窗口（Token）。用于非 code 模式的对话压缩触发阈值。 */
   contextWindowTokens: number;
+  /** 主模型请求的额外重试次数；旧调用回退到 5。 */
+  modelRequestMaxRetries?: number;
 }
 
 export type AgentExecutionMode = "work" | "chat";
@@ -104,8 +111,10 @@ export interface CyreneRunOptions {
    *   不得再各自生成 harness-${Date.now()} 等本地 ID。
    */
   runId?: string;
-  /** 用户明确要求继续的旧 Harness Run；仅由恢复入口注入。 */
-  resumeFromRunId?: string;
+  /** UI assistant 占位消息 ID，用于图片事件和文本消息保持同一关联。 */
+  assistantTurnId?: string;
+  /** 写入用户数据目录的生成图片存储。 */
+  generatedImageStore?: import("../chats/generated-image-store").GeneratedImageStore;
   /** 原始消息（不含 system）。system 由 chat-loop / harness-adapter 按 promptLayers 组装，不随消息持久化。 */
   messages: ChatMessage[];
   conversationId?: string;
@@ -154,6 +163,8 @@ export interface CyreneRunOptions {
   runtimeEnvironmentContext?: string;
   /** 上一次异常中断 Run 的只读 Todo/执行检查点；只用于帮助模型恢复方向。 */
   recoveryContext?: string;
+  /** 会话轨迹投影出的待办与未决副作用，作为新 Harness 的执行状态恢复。 */
+  initialHarnessState?: Pick<import("./harness/types").AgentState, "todoItems" | "uncertainEffects">;
   /** 由 AG-UI bridge 注入，确保 Ask 卡片回到实际发起本轮的渲染窗口。 */
   requestUserClarification?: (
     card: import("../../shared/ask-clarification").AskClarificationCard,
@@ -194,6 +205,19 @@ export interface CyreneRunOptions {
    * 只携带稳定元数据供插件事件旁路使用，不参与执行决策。
    */
   onToolFinished?: (event: import("./harness/types").HarnessToolFinishedEvent) => void;
+  /**
+   * 插话轮询（AG-UI bridge 注入，透传给 harness）：
+   * 返回待插入当前运行的用户消息；harness 在每轮模型请求前与最终结算前调用。
+   * Chat 无工具链路是单请求运行，不消费该回调。
+   */
+  pollRunAdjustments?: () => Promise<import("./harness/types").RunAdjustmentMessage[]> | undefined;
+  /**
+   * Run 级轨迹提交端（CTA Phase 1）：canonical 消息权威落盘。
+   * 桌面链路由上游创建并注入；缺省（渠道/插件/测试）不写轨迹。
+   */
+  transcriptSink?: import("./transcript-sink").TranscriptSink;
+  /** 绑定当前会话和模型的持久化压缩入口。 */
+  compactTranscript?: import("./harness/types").HarnessInput["compactTranscript"];
 }
 
 /** Agent run 最终结果（供桥层做副作用用）。 */
@@ -201,6 +225,7 @@ export interface CyreneRunResult {
   reply: string;
   toolResults: ToolCallResult[];
   totalUsage?: { input: number; output: number };
+  modelFailure?: import("../../shared/model-error").ModelFailureInfo;
   soulPhaseReason?: "no_tool" | "max_rounds" | "timeout" | "tool_error";
   executionMode?: AgentExecutionMode;
   socialContext?: CyreneRunOptions["socialContext"];
@@ -258,12 +283,16 @@ export function toAguiEvent(event: AgentLoopEvent): BaseEvent {
       return { type: EventType.STEP_STARTED, stepName: event.stepName };
     case "step_finished":
       return { type: EventType.STEP_FINISHED, stepName: event.stepName };
-    case "tool_call_start":
+    case "tool_call_start": {
+      // 查注册表补中文展示名；查不到不填，前端回退原始 ID
+      const registryTool = toolRegistry.getById(event.toolCallName ?? "");
       return {
         type: EventType.TOOL_CALL_START,
         toolCallId: event.toolCallId,
         toolCallName: event.toolCallName,
+        toolCallDisplayName: registryTool?.name,
       };
+    };
     case "tool_call_args":
       return {
         type: EventType.TOOL_CALL_ARGS,
@@ -301,14 +330,24 @@ export function toAguiEvent(event: AgentLoopEvent): BaseEvent {
       return { type: EventType.REASONING_MESSAGE_CONTENT, messageId: event.messageId, delta: event.delta };
     case "reasoning_message_end":
       return { type: EventType.REASONING_MESSAGE_END, messageId: event.messageId };
-    case "compressing_context":
-      return { type: EventType.CUSTOM, name: "cyrene.compressingContext", value: { text: "昔涟正在压缩上下文…" } };
     case "context_usage":
       // 上下文容量快照：与 harness-adapter 的同名 CUSTOM 事件对齐。
       return {
         type: EventType.CUSTOM,
         name: "cyrene.context.usage",
         value: event.contextUsage,
+      } as BaseEvent;
+    case "image_attachments":
+      return {
+        type: EventType.CUSTOM,
+        name: "cyrene.image_attachments",
+        value: { messageId: event.messageId, roundId: event.roundId, attachments: event.attachments },
+      } as BaseEvent;
+    case "model_retry":
+      return {
+        type: EventType.CUSTOM,
+        name: "cyrene.model.retry",
+        value: event.status,
       } as BaseEvent;
     default:
       // v3: 未知事件类型转为 CUSTOM 占位，不再抛错
@@ -457,6 +496,10 @@ export class CyreneAgent extends AbstractAgent {
               onEvent,
               signal: abortController.signal,
               mode: options.conversationMode,
+              transcriptSink: options.transcriptSink,
+              conversationId: options.conversationId,
+              assistantTurnId: options.assistantTurnId,
+              generatedImageStore: options.generatedImageStore,
             }));
           } else {
             const executeTool = (tc: Parameters<typeof executeToolCall>[0], runnableToolIds: Set<string>) => executeToolCall(tc, runnableToolIds, {
@@ -488,12 +531,22 @@ export class CyreneAgent extends AbstractAgent {
             soulPhaseReason: result.completionReason,
             executionMode,
             socialContext: options.socialContext,
+            ...(result.modelFailure ? { modelFailure: result.modelFailure } : {}),
             // 优先使用 harness-adapter 上报的 terminal；否则按 completionReason 推断
             terminal: result.terminal ?? terminalFromCompletionReason(result.completionReason),
           };
           flowLog("── 本轮完成 ────────────────────────");
 
           if (cancelled) return;
+          // timeout 属系统侧未完成（非用户取消）：写 runtime_error interruption 边界。
+          // Harness 路径已在 adapter 内按 runStore 闭合过，这里幂等重写不产生重复条目
+          if (this.lastResult.terminal?.status === "timeout") {
+            try {
+              await options.transcriptSink?.closeInterruption({ reason: "runtime_error", runSession: null });
+            } catch (closureError) {
+              console.error(LOG_PREFIX, "transcript timeout closure failed:", closureError);
+            }
+          }
           // success / timeout 都通过 RUN_FINISHED.result 上报 canonical 终态。
           // Bridge 据此决定是否跑 sticker / memory 等成功收尾副作用。
           subscriber.next({
@@ -501,6 +554,7 @@ export class CyreneAgent extends AbstractAgent {
             threadId,
             runId,
             result: this.lastResult.terminal,
+            ...(this.lastResult.modelFailure ? { metadata: { cyreneModelFailure: this.lastResult.modelFailure } } : {}),
           });
           finished = true;
           detachExternalAbort();
@@ -516,6 +570,29 @@ export class CyreneAgent extends AbstractAgent {
           );
           console.error(LOG_PREFIX, `run 失败 [${classification.source}]:`, classification.diagnostics);
           if (classification.source === "user_cancelled") {
+            // 权威轨迹：取消边界先于终态事件落盘。
+            // ChatLoop 无工具调用，runSession 传空只写 interruption 边界；
+            // Harness 路径已在 adapter 内按 runStore 状态闭合，这里幂等不重复。
+            try {
+              await options.transcriptSink?.closeInterruption({ reason: "user_cancel", runSession: null });
+            } catch (closureError) {
+              // 闭合失败不得伪装成取消成功：按运行时错误上报
+              console.error(LOG_PREFIX, "transcript interruption closure failed:", closureError);
+              subscriber.next({
+                type: EventType.RUN_FINISHED,
+                threadId,
+                runId,
+                result: {
+                  status: "runtime_error",
+                  reason: "transcript_interruption_closure_failed",
+                  externalEffectsMayContinue: true,
+                },
+              });
+              finished = true;
+              detachExternalAbort();
+              subscriber.complete();
+              return;
+            }
             // 取消走 RUN_FINISHED + result.status="cancelled"，
             // 不伪装成 AG-UI interrupt，也不写 outcome。
             subscriber.next({
@@ -533,7 +610,17 @@ export class CyreneAgent extends AbstractAgent {
             subscriber.complete();
             return;
           }
-          const safeErr = new Error(classification.userMessage);
+          // 权威轨迹：运行失败（含 ChatLoop 抛错）同样写 runtime_error interruption
+          // 边界，下一轮上下文能区分「系统没完成」与「用户主动取消」；
+          // 闭合失败只记日志——终态本身就是失败，不再改写
+          try {
+            await options.transcriptSink?.closeInterruption({ reason: "runtime_error", runSession: null });
+          } catch (closureError) {
+            console.error(LOG_PREFIX, "transcript failure closure failed:", closureError);
+          }
+          const safeErr = new AgentRuntimeError("E_MODEL_REQUEST_FAILED", classification.userMessage, {
+            ...(classification.modelFailure ? { modelFailure: classification.modelFailure } : {}),
+          });
           finished = true;
           detachExternalAbort();
           subscriber.error(safeErr);
@@ -580,6 +667,7 @@ export interface AbortDiagnostic {
   phase: AbortPhase;
   userMessage: string;
   diagnostics: Record<string, unknown>;
+  modelFailure?: import("../../shared/model-error").ModelFailureInfo;
 }
 
 /** 分类 abort/error 来源，返回用户安全消息和诊断信息 */
@@ -652,6 +740,7 @@ export function classifyRunError(
       phase,
       userMessage,
       diagnostics,
+      ...(err.modelFailure ? { modelFailure: err.modelFailure } : {}),
     };
   }
 

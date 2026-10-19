@@ -11,11 +11,32 @@
 import type { ToolCall } from "../vendors/types";
 import type { ToolDefinition } from "../tools/registry/tool-registry";
 import type { ToolCallResult } from "../types";
-import type { AgentState, HarnessEvent, ToolObservation } from "./types";
+import type { AgentState, HarnessEvent, SideEffectKind, TodoItem, ToolObservation } from "./types";
 import { parseToolCallArgs, toolCallFingerprint } from "./types";
-import { isHarnessBuiltin, isInteractiveHarnessBuiltin, TASK_TOOL_ID } from "./builtin-tools";
-import { executeUpdateTodo, executeAskUser, executeTask } from "./builtin-tools";
-import { ENTER_PLAN_MODE_TOOL_ID, WRITE_PLAN_TOOL_ID, executeEnterPlanMode, executeWritePlan } from "./plan-tools";
+import {
+  CONFIRM_UNCERTAIN_EFFECT_TOOL_ID,
+  UPDATE_TODO_TOOL_ID,
+  ASK_USER_TOOL_ID,
+  isHarnessBuiltin,
+  isInteractiveHarnessBuiltin,
+  TASK_TOOL_ID,
+  CLOSE_TASK_TOOL_ID,
+} from "./builtin-tools";
+import {
+  executeUpdateTodo,
+  executeAskUser,
+  executeTask,
+  executeCloseTask,
+  executeConfirmUncertainEffect,
+} from "./builtin-tools";
+import {
+  ENTER_PLAN_MODE_TOOL_ID,
+  WRITE_PLAN_TOOL_ID,
+  SUBMIT_PLAN_TOOL_ID,
+  executeEnterPlanMode,
+  executeWritePlan,
+  executeSubmitPlan,
+} from "./plan-tools";
 import { executeReadToolResult, READ_TOOL_RESULT_TOOL_ID } from "./tool-output/read-tool-result";
 import { resolveSideEffect } from "./side-effect-resolver";
 import { extractFileChangesFromOutput } from "../tools/registry/tool-evidence";
@@ -23,8 +44,56 @@ import { isBlockedByUncertainEffect } from "./uncertain-effect-guard";
 import { ExecutionLedger } from "../execution-ledger";
 import type { ToolExecutionOutcome } from "../types";
 import { executeToolDefinition } from "../tools/registry/tool-executor";
+import { toolRegistry } from "../tools/registry/tool-registry";
 import type { ToolOutputStore } from "./tool-output/tool-output-store";
 import { ToolOutputPersistenceError } from "./tool-output/file-tool-output-store";
+
+const READ_ONLY_BUILTINS = new Set([
+  ASK_USER_TOOL_ID,
+  CONFIRM_UNCERTAIN_EFFECT_TOOL_ID,
+  READ_TOOL_RESULT_TOOL_ID,
+  SUBMIT_PLAN_TOOL_ID,
+]);
+const IDEMPOTENT_BUILTINS = new Set([
+  UPDATE_TODO_TOOL_ID,
+  CLOSE_TASK_TOOL_ID,
+  ENTER_PLAN_MODE_TOOL_ID,
+  WRITE_PLAN_TOOL_ID,
+]);
+
+function parseMailDraftPresentation(
+  toolName: string,
+  args: Record<string, unknown>,
+  output: string,
+): ToolObservation["presentation"] | undefined {
+  const isDraftProducer = toolName === "email_create_draft"
+    || ((toolName === "gmail_reply" || toolName === "gmail_forward") && args.action === "draft");
+  if (!isDraftProducer || output.length > 250_000) return undefined;
+  try {
+    const value = JSON.parse(output) as Record<string, unknown>;
+    const card = value?.kind === "mail_draft_card" && value.card && typeof value.card === "object" && !Array.isArray(value.card)
+      ? value.card as Record<string, unknown>
+      : undefined;
+    return card ? { type: "mail_draft_card", data: card } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Keep built-in lifecycle metadata accurate when no registry definition exists. */
+export function resolveToolDispatchSideEffect(
+  toolName: string,
+  args: Record<string, unknown>,
+  tools: ToolDefinition[],
+): SideEffectKind {
+  const registered = tools.find((tool) => tool.id === toolName);
+  if (registered) return resolveSideEffect(registered, args);
+  if (READ_ONLY_BUILTINS.has(toolName)) return "read_only";
+  if (IDEMPOTENT_BUILTINS.has(toolName)) return "idempotent_mutation";
+  // Delegated work can outlive a caller crash, so it remains conservative.
+  if (toolName === TASK_TOOL_ID) return "non_idempotent_side_effect";
+  return "non_idempotent_side_effect";
+}
 
 // ── 工具输出截断 ─────────────────────────────────────────
 
@@ -76,6 +145,8 @@ export interface ToolDispatchContext {
   onEvent?: (event: HarnessEvent) => void;
   requestUserClarification?: (card: unknown) => Promise<unknown>;
   includeInteractiveTools?: boolean;
+  allowedBuiltinToolIds?: ReadonlySet<string>;
+  signal?: AbortSignal;
   checkPermission?: (toolId: string, args: Record<string, unknown>) => Promise<boolean>;
   toolContext?: import("../tools/registry/tool-context").ToolContext;
   truncation?: TruncationConfig;
@@ -85,6 +156,23 @@ export interface ToolDispatchContext {
   deferOutputPersistence?: boolean;
   executionLedger?: ExecutionLedger;
   taskExecutor?: import("../task-runtime").TaskExecuteRequest extends infer _T ? (request: import("../task-runtime").TaskExecuteRequest) => Promise<import("../task-runtime").TaskExecuteResult> : never;
+  closeTaskExecutor?: (request: import("../task-runtime").TaskCloseRequest) => import("../task-runtime").TaskCloseResult | Promise<import("../task-runtime").TaskCloseResult>;
+  /** Persist the dispatch boundary before emitting lifecycle or invoking the tool. */
+  onToolStarted?: (input: {
+    toolCallId: string;
+    toolName: string;
+    sideEffect: SideEffectKind;
+    fingerprint: string;
+    repeatAuthorizationId?: string;
+  }) => Promise<void>;
+  /** Persist one-shot user authorization before it becomes available to dispatch. */
+  onEffectResolution?: (input: {
+    effectId: string;
+    authorizationId: string;
+    fingerprint: string;
+    grantedAt: number;
+  }) => Promise<void>;
+  onTaskState?: (input: { toolCallId: string; items: TodoItem[] }) => Promise<void>;
 }
 
 export interface ToolDispatchResult extends ToolObservation {
@@ -102,27 +190,12 @@ export async function dispatchToolCall(
   call: ToolCall,
   ctx: ToolDispatchContext,
 ): Promise<ToolDispatchResult> {
-  // ── 内置工具 ──
-  if (isHarnessBuiltin(call.name)) {
-    if (ctx.includeInteractiveTools === false && isInteractiveHarnessBuiltin(call.name)) {
-      return {
-        outcome: "failure",
-        category: "not_found",
-        tool: call.name,
-        message: "当前渠道不支持交互式工具",
-      };
-    }
-    const result = await executeHarnessBuiltin(call, ctx);
-    return ctx.deferOutputPersistence ? result : persistToolDispatchResult(call, result, ctx);
-  }
-
-  // ── 普通工具 ──
   const args = parseToolCallArgs(call);
-  const tool = ctx.tools.find((t) => t.id === call.name);
-
-  // fingerprint 拦截（已不确定的副作用在授权前禁止自动重放）
   const fingerprint = toolCallFingerprint(call.name, args);
-  const blockingEffect = ctx.state.uncertainEffects.find((effect) => effect.fingerprint === fingerprint);
+  const failSafeFingerprint = `${call.name}(*)`;
+  const blockingEffect = ctx.state.uncertainEffects.find((effect) =>
+    effect.fingerprint === fingerprint || effect.fingerprint === failSafeFingerprint,
+  );
   if (isBlockedByUncertainEffect(ctx.state, fingerprint)) {
     return {
       outcome: "not_executed",
@@ -133,8 +206,58 @@ export async function dispatchToolCall(
     };
   }
 
+  // ── 内置工具 ──
+  if (isHarnessBuiltin(call.name)) {
+    if (ctx.allowedBuiltinToolIds && !ctx.allowedBuiltinToolIds.has(call.name)) {
+      return { outcome: "failure", category: "not_found", tool: call.name, message: "当前子任务未开放此工具。" };
+    }
+    if (ctx.includeInteractiveTools === false && isInteractiveHarnessBuiltin(call.name)) {
+      return {
+        outcome: "failure",
+        category: "not_found",
+        tool: call.name,
+        message: "当前渠道不支持交互式工具",
+      };
+    }
+    const sideEffect = resolveToolDispatchSideEffect(call.name, args, ctx.tools);
+    const repeatAuthorization = blockingEffect?.repeatAuthorization;
+    if (repeatAuthorization) delete blockingEffect.repeatAuthorization;
+    await ctx.onToolStarted?.({
+      toolCallId: call.id,
+      toolName: call.name,
+      sideEffect,
+      fingerprint,
+      ...(repeatAuthorization ? { repeatAuthorizationId: repeatAuthorization.id } : {}),
+    });
+    if (ctx.signal?.aborted) {
+      return {
+        outcome: "not_executed",
+        category: "runtime_safety",
+        tool: call.name,
+        message: "工具已记录开始，但在实际派发前被取消",
+      };
+    }
+    ctx.onEvent?.({ type: "tool_start", toolCallId: call.id, toolName: call.name, args });
+    const result = await executeHarnessBuiltin(call, ctx);
+    return ctx.deferOutputPersistence ? result : persistToolDispatchResult(call, result, ctx);
+  }
+
+  // ── 普通工具 ──
+  const tool = ctx.tools.find((t) => t.id === call.name);
+
   // 工具不存在
   if (!tool) {
+    const registeredTool = toolRegistry.getById(call.name);
+    if (registeredTool?.browserControlPhase === "active") {
+      return {
+        outcome: "failure",
+        category: "not_found",
+        tool: call.name,
+        message:
+          `浏览器交互工具“${call.name}”当前没有开放给本轮。请先调用 browser_control_start 并确认控制已开启；` +
+          "只有后续模型请求的可用工具列表中出现该工具后，才能调用它。",
+      };
+    }
     return {
       outcome: "failure",
       category: "not_found",
@@ -156,12 +279,35 @@ export async function dispatchToolCall(
     }
   }
 
+  // Reserve a matching one-shot authorization synchronously so parallel calls
+  // cannot both consume it. If persistence fails, the next recovery projection
+  // restores it because no authorized tool_started event was committed.
+  const repeatAuthorization = blockingEffect?.repeatAuthorization;
+  if (repeatAuthorization) delete blockingEffect.repeatAuthorization;
+  const sideEffect = resolveToolDispatchSideEffect(call.name, args, ctx.tools);
+  await ctx.onToolStarted?.({
+    toolCallId: call.id,
+    toolName: call.name,
+    sideEffect,
+    fingerprint,
+    ...(repeatAuthorization ? { repeatAuthorizationId: repeatAuthorization.id } : {}),
+  });
+  if (ctx.signal?.aborted) {
+    return {
+      outcome: "not_executed",
+      category: "runtime_safety",
+      tool: call.name,
+      message: "工具已记录开始，但在实际派发前被取消",
+    };
+  }
+
   // 执行工具
   ctx.onEvent?.({
     type: "tool_start",
     toolCallId: call.id,
     toolName: call.name,
-    args,
+    args: tool.sensitiveArgs ? { redacted: true } : args,
+    displayName: tool.name,
   });
 
   let result: ToolCallResult;
@@ -171,8 +317,18 @@ export async function dispatchToolCall(
     : args.url !== undefined ? [String(args.url)]
     : [];
 
-  const run = async (): Promise<ToolExecutionOutcome> => executeToolDefinition(tool, args, ctx.toolContext);
-  if (ctx.executionLedger) {
+  const shellContext = call.name === "run_shell" && ctx.onEvent
+    ? {
+        ...ctx.toolContext,
+        userQuery: ctx.toolContext?.userQuery ?? "",
+        onShellOutput: (update: import("../tools/registry/tool-context").ShellOutputUpdate) => {
+          try { ctx.toolContext?.onShellOutput?.(update); } catch { /* 观察者不能中断命令 */ }
+          try { ctx.onEvent?.({ type: "tool_output", toolCallId: call.id, ...update }); } catch { /* UI 事件不能中断命令 */ }
+        },
+      }
+    : ctx.toolContext;
+  const run = async (): Promise<ToolExecutionOutcome> => executeToolDefinition(tool, args, shellContext);
+  if (ctx.executionLedger && tool.ledgerPolicy !== "bypass" && !tool.sensitiveArgs && !tool.sensitiveOutput) {
     const ledgerResult = await ctx.executionLedger.execute(
       { logicalInvocationId: `${ctx.toolContext?.runId ?? "unknown"}:${call.id}`, capability: tool.id, targetRefs, args },
       run,
@@ -189,7 +345,6 @@ export async function dispatchToolCall(
 
   // 截断输出（长输出按预算截断，只把可消费的 preview 交给模型）
   const truncationConfig = ctx.truncation ?? DEFAULT_TRUNCATION;
-  const sideEffect = resolveSideEffect(tool, args);
   const { preview, truncated } = truncateOutput(
     result.output,
     truncationConfig,
@@ -215,17 +370,26 @@ export async function dispatchToolCall(
     }
   }
 
+  const presentation = parseMailDraftPresentation(call.name, args, result.output);
   const observation: ToolDispatchResult = {
     outcome,
     category: result.category,
     toolSideEffect: sideEffect,
     retryDecision: result.retryable ? "retry" : "no_retry",
     tool: call.name,
-    target: (args.path as string | undefined) ?? (args.command as string | undefined) ?? (args.query as string | undefined),
+    ...(!tool.sensitiveArgs ? {
+      target: (args.path as string | undefined) ?? (args.command as string | undefined) ?? (args.query as string | undefined),
+    } : {}),
     message: preview,
     output: result.output,
     truncated,
     preview,
+    ...(tool.sensitiveOutput ? {
+      activityPreview: result.status === "succeeded"
+        ? tool.name.includes("draft") || args.action === "draft" ? "邮件草稿已准备" : "邮件操作已完成"
+        : "邮件操作未成功",
+    } : {}),
+    ...(presentation ? { presentation } : {}),
     rawResult: result,
   };
   const persisted = ctx.deferOutputPersistence
@@ -237,9 +401,9 @@ export async function dispatchToolCall(
       type: "tool_end",
       toolCallId: call.id,
       outcome: result.status === "succeeded" ? "success" : "failure",
-      preview: preview.slice(0, 200),
+      preview: (observation.activityPreview ?? preview).slice(0, 200),
       // Diff Review 卡片证据走独立字段，不受 preview 截断影响
-      changes: extractFileChangesFromOutput(result.output),
+      changes: tool.sensitiveOutput ? undefined : extractFileChangesFromOutput(result.output),
     });
   }
 
@@ -255,6 +419,7 @@ export async function persistToolDispatchResult(
   result: ToolDispatchResult,
   ctx: ToolDispatchContext,
 ): Promise<ToolDispatchResult> {
+  if (ctx.tools.find((tool) => tool.id === call.name)?.sensitiveOutput) return result;
   if (!shouldPersistResult(call, result) || !ctx.toolOutputStore || result.toolOutputRef) return result;
   const conversationId = ctx.toolContext?.conversationId;
   const runId = ctx.toolContext?.runId;
@@ -301,16 +466,34 @@ async function executeHarnessBuiltin(
 ): Promise<ToolDispatchResult> {
   switch (call.name) {
     case "update_todo":
-      return executeUpdateTodo(call, ctx.state, ctx.onEvent);
+      return executeUpdateTodo(call, ctx.state, ctx.onEvent, (items) =>
+        ctx.onTaskState?.({ toolCallId: call.id, items }) ?? Promise.resolve(),
+      );
 
     case "ask_user":
       return executeAskUser(call, ctx.requestUserClarification, ctx.onEvent);
+    case CONFIRM_UNCERTAIN_EFFECT_TOOL_ID: {
+      const runId = ctx.toolContext?.runId ?? "unknown-run";
+      return executeConfirmUncertainEffect(
+        call,
+        ctx.state,
+        ctx.requestUserClarification,
+        {
+          authorizationId: `${runId}:repeat:${call.id}`,
+          onAuthorized: (authorization) => ctx.onEffectResolution?.(authorization),
+        },
+      );
+    }
     case ENTER_PLAN_MODE_TOOL_ID:
       return executeEnterPlanMode(call, ctx.toolContext, ctx.onEvent);
     case WRITE_PLAN_TOOL_ID:
       return executeWritePlan(call, ctx.toolContext, ctx.onEvent);
+    case SUBMIT_PLAN_TOOL_ID:
+      return executeSubmitPlan(call, ctx.toolContext, ctx.requestUserClarification, ctx.onEvent);
     case "task":
       return executeTask(call, ctx.taskExecutor);
+    case CLOSE_TASK_TOOL_ID:
+      return executeCloseTask(call, ctx.closeTaskExecutor);
     case READ_TOOL_RESULT_TOOL_ID:
       return executeReadToolResult(call, ctx.toolOutputStore, ctx.toolContext);
 

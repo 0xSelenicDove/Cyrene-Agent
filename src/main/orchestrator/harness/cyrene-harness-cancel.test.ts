@@ -55,10 +55,17 @@ const { fakeAdapter, fakeStreamChatWithSdk, recordUsage, recordRequest } = vi.ho
 vi.mock("../vendors", () => ({
   getAdapterForConfig: vi.fn(() => fakeAdapter),
   streamChatWithSdk: fakeStreamChatWithSdk,
+  generateChatWithAiSdk: async (input: { adapter: typeof fakeAdapter; request: unknown; signal?: AbortSignal }) => {
+    const http = input.adapter.buildRequest(input.request);
+    const response = await fetch(http.url, { method: "POST", headers: http.headers, body: http.body, signal: input.signal });
+    if (!response.ok) throw new Error(`模型请求失败：HTTP ${response.status}`);
+    return input.adapter.parseResponse(await response.json());
+  },
   resolveTransport: vi.fn(() => "openai"),
 }));
 
-vi.mock("./tool-dispatcher", () => ({
+vi.mock("./tool-dispatcher", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./tool-dispatcher")>(),
   dispatchToolCall: vi.fn(),
   persistToolDispatchResult: vi.fn(async (_call: unknown, result: unknown) => result),
 }));
@@ -154,6 +161,15 @@ function mutationToolCall(id = "call-1"): ToolCall {
     id,
     name: "write_file",
     arguments: JSON.stringify({ path: "/tmp/x", content: "hello" }),
+  };
+}
+
+/** 与注册的 readTool（effectKind: "read"）匹配的读取调用：retry backoff 场景需要可重试的副作用分类。 */
+function readToolCall(id = "call-1"): ToolCall {
+  return {
+    id,
+    name: "read_file",
+    arguments: JSON.stringify({ path: "/tmp/x" }),
   };
 }
 
@@ -382,8 +398,8 @@ describe("CyreneHarness cancellation propagation", () => {
       signal: controller.signal,
     });
 
-    // 第一轮：模型调用工具
-    fetchMock.nextResolve(assistantResponse({ toolCalls: [mutationToolCall("call-1")] }));
+    // 第一轮：模型调用工具（read_file 与注册的 readTool 匹配，transient 失败才可重试）
+    fetchMock.nextResolve(assistantResponse({ toolCalls: [readToolCall("call-1")] }));
     await vi.waitFor(() => expect(mockedDispatch).toHaveBeenCalled());
 
     // 工具失败（transient → 决定 retry，进入 backoff sleep）

@@ -12,7 +12,6 @@ function makeServices(): CoreServices {
     social: {} as never,
     tts: {} as never,
     ttsSession: {} as never,
-    embedding: { scheduleStartupRefreshes: vi.fn() } as never,
     proactive: {} as never,
     git: { dispose: vi.fn() } as never,
     lsp: { disposeAll: vi.fn() } as never,
@@ -49,8 +48,6 @@ function makeCoreDeps(calls: string[], overrides: Partial<CoreDependencies> = {}
         }),
         onPetWindowReady: vi.fn(),
         onPetWindowClosed: vi.fn(),
-        createSidebarWindow: vi.fn(),
-        createTasksWindow: vi.fn(),
         setPetWindowAlwaysOnTop: vi.fn(),
         applyPetWindowZoom: vi.fn(),
       },
@@ -82,7 +79,7 @@ function makeCoreDeps(calls: string[], overrides: Partial<CoreDependencies> = {}
     createScheduler: () => ({ initialize: () => { calls.push("scheduler-initialize"); }, start: vi.fn(() => { calls.push("scheduler-start"); }), stop: vi.fn() } as never),
     registerCoreIpc: () => { calls.push("register-core-ipc"); },
     wireToastCenter: () => { calls.push("wire-toast-center"); },
-    loadGeneralSettings: () => ({ petVisible: true, sidebarVisible: false, tasksVisible: false }) as never,
+    loadGeneralSettings: () => ({ petVisible: true }) as never,
     applyGeneralSettings: () => { calls.push("apply-settings"); },
     revealStartupWindows: async () => { calls.push("reveal"); },
     minimumSplashMs: 2500,
@@ -149,6 +146,19 @@ describe("startCore", () => {
     expect(calls).toContain("plugins-start");
   });
 
+  it("passes the constructed Agent Runtime to plugin startup", async () => {
+    const runtime = { buildOptions: vi.fn() } as never;
+    const startPlugins = vi.fn(async () => ({ stop: vi.fn(async () => undefined) } as never));
+    const deps = makeCoreDeps([], {
+      createRuntime: () => runtime,
+      startPlugins,
+    });
+
+    await startCore(deps);
+
+    expect(startPlugins).toHaveBeenCalledWith(expect.anything(), expect.anything(), runtime);
+  });
+
   it("degrades skills failure and continues startup", async () => {
     const deps = makeCoreDeps([], {
       initSkills: () => { throw new Error("skills broken"); },
@@ -169,18 +179,23 @@ describe("startCore", () => {
     expect(markReadySpy).not.toHaveBeenCalled();
   });
 
-  it("creates the pet window only when petVisible is enabled", async () => {
+  it("always creates the pet window; petVisible only controls whether it shows", async () => {
     const deps = makeCoreDeps([]);
     await startCore(deps);
     expect(deps.petWindowCreated).toBe(true);
+    expect(deps.shell.windowManager.createPetWindow).toHaveBeenCalledWith(true);
 
     const hidden = makeCoreDeps([], {
-      loadGeneralSettings: () => ({ petVisible: false, sidebarVisible: false, tasksVisible: false }) as never,
+      loadGeneralSettings: () => ({ petVisible: false }) as never,
     });
     await startCore(hidden);
-    expect(hidden.petWindowCreated).toBe(false);
-    expect(hidden.shell.windowManager.createSidebarWindow).not.toHaveBeenCalled();
-    expect(hidden.shell.windowManager.createTasksWindow).not.toHaveBeenCalled();
+    // 隐藏时窗口仍创建（不显示），托盘"显示桌宠"与设置开关随时能救回；
+    // alwaysOnTop / zoom / live2d 生命周期在隐藏状态下同样接线。
+    expect(hidden.petWindowCreated).toBe(true);
+    expect(hidden.shell.windowManager.createPetWindow).toHaveBeenCalledWith(false);
+    expect(hidden.shell.windowManager.setPetWindowAlwaysOnTop).toHaveBeenCalled();
+    expect(hidden.shell.windowManager.applyPetWindowZoom).toHaveBeenCalled();
+    expect(hidden.shell.windowManager.onPetWindowReady).toHaveBeenCalled();
   });
 
   it("runs reveal after core-ready and drains activation last", async () => {

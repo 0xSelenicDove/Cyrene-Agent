@@ -29,6 +29,7 @@ import { startInboundServer, stopInboundServer } from "./inbound-server";
 import { FeishuAdapter } from "./adapters/feishu";
 import { ILinkBotAdapter, loadCredentials } from "./adapters/wechat/ilink-bot-adapter";
 import { NapCatAdapter } from "./adapters/qq/napcat-adapter";
+import { resolveQqListenAuthRequirement } from "./adapters/qq/onebot-reverse-ws";
 import { QqBotAdapter } from "./adapters/qqbot/qqbot-adapter";
 import { getRecentLog, clearLog, reloadLogFromDisk } from "./message-log";
 import { logger, LogTag } from "../logger";
@@ -168,6 +169,14 @@ function registerChannelsIpc(
 
   ipc.handle(IPC.CHANNELS_GET_STATUS, () => channelManager.getAllStatus());
 
+  // QQ 监听鉴权预检：渲染进程看不到网络接口，无法自行判断监听地址是否回环，
+  // 因此「是否需要 Access Token」只能由主进程给出（与启动时的硬校验同一实现）。
+  ipc.handle(IPC.CHANNELS_QQ_RESOLVE_AUTH_REQUIREMENT, (_e, payload: unknown) =>
+    resolveQqListenAuthRequirement(
+      (payload ?? {}) as { listenMode?: unknown; customHost?: unknown },
+    ),
+  );
+
   ipc.handle(IPC.CHANNELS_RESTART, async () => {
     await channelManager.stopAll();
     await channelManager.startAll();
@@ -186,8 +195,8 @@ function registerChannelsIpc(
 	  ipc.handle(IPC.CHANNELS_WECHAT_LOGIN_START, async () => {
 	    if (!wxAdapter) return { ok: false, error: "adapter 未初始化" };
 	    try {
-	      const { fetchQrCode } = await import("./adapters/wechat/ilink-protocol-client");
-	      const { createQrDataUrl } = await import("./adapters/wechat/qr");
+	      const { fetchQrCode } = await import("./adapters/wechat/ilink-protocol-client.js");
+	      const { createQrDataUrl } = await import("./adapters/wechat/qr.js");
 
 	      // 1. 拿原始 qrcode 字符串 + liteapp 二维码 URL
 	      //    - qrcode: 32 hex ticket（轮询 get_qrcode_status 用）
@@ -311,15 +320,15 @@ function registerChannelsIpc(
     return { ok: true };
   });
 
-  ipc.handle(IPC.CHANNELS_CONTEXT_BINDINGS_GET, () => {
-    return getContextBindingSnapshot(getChannelConversationBindingStore(), listSessions());
+  ipc.handle(IPC.CHANNELS_CONTEXT_BINDINGS_GET, async () => {
+    return getContextBindingSnapshot(getChannelConversationBindingStore(), (await listSessions()));
   });
 
   ipc.handle(IPC.CHANNELS_CONTEXT_BIND, (_e, payload: unknown) => {
     return bindContextConversation(
       getChannelConversationBindingStore(),
       payload,
-      (conversationId) => getSession(conversationId) !== null,
+      async (conversationId) => (await getSession(conversationId)) !== null,
     );
   });
 

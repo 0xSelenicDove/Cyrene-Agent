@@ -17,10 +17,12 @@ import type { AgentRuntime } from "../orchestrator/agent-runtime";
 import type { RuntimeStateService } from "../orchestrator/runtime-state-service";
 import type { TtsSynthesisService } from "../services/tts/tts-synthesis-service";
 import type { TtsSessionService } from "../tts/tts-session-service";
-import type { EmbeddingIndexService } from "../services/embedding/embedding-index-service";
 import type { ProactiveLifecycle } from "../proactive/proactive-lifecycle";
 import type { GitService } from "../code-git/git-service";
 import type { LspManager } from "../lsp/manager";
+import type { GmailAuthService } from "../email/gmail-auth-service";
+import type { GmailService } from "../email/gmail-service";
+import type { MailAttachmentStore } from "../email/mail-attachment-store";
 import type { ScreenshotService } from "../screenshot/screenshot-lifecycle";
 import type { MusicBootstrap } from "../music/bootstrap";
 import type { AppUpdateService } from "../updater/app-update-service";
@@ -32,6 +34,7 @@ import type { SchedulerSubsystem } from "../scheduler/bootstrap";
 import type { GeneralSettings } from "../settings/general-settings";
 import type { WindowManager } from "../windows/window-manager";
 import type { PluginManager } from "../../plugins/manager";
+import { CURRENT_DISCLAIMER_VERSION } from "../../shared/disclaimer";
 
 export interface CoreServices {
   runtimeState: RuntimeStateService;
@@ -40,10 +43,12 @@ export interface CoreServices {
   social: SocialContextService;
   tts: TtsSynthesisService;
   ttsSession: TtsSessionService;
-  embedding: EmbeddingIndexService;
   proactive: ProactiveLifecycle;
   git: GitService;
   lsp: LspManager;
+  gmailAuth: GmailAuthService;
+  gmail: GmailService;
+  mailAttachmentStore: MailAttachmentStore;
   screenshot: ScreenshotService;
   music: MusicBootstrap;
   update: AppUpdateService;
@@ -81,9 +86,9 @@ export interface CoreDependencies {
   createRuntime(services: CoreServices): AgentRuntime;
   createChannels(runtime: AgentRuntime, services: CoreServices): ChannelsSubsystem;
   /** 必须在内置渠道适配器注册完成后调用；scheduler 先于本步完成 initialize。 */
-  startPlugins(services: CoreServices, scheduler: SchedulerSubsystem): Promise<PluginManager>;
+  startPlugins(services: CoreServices, scheduler: SchedulerSubsystem, runtime: AgentRuntime): Promise<PluginManager>;
   createScheduler(runtime: AgentRuntime, services: CoreServices): SchedulerSubsystem;
-  registerCoreIpc(input: RegisterCoreIpcInput): void;
+  registerCoreIpc(input: RegisterCoreIpcInput): void | Promise<void>;
   /** 组合根装配提醒中心：注册 toast IPC、订阅事件总线、预创建隐藏窗口。 */
   wireToastCenter(input: { ipc: IpcScope; windowManager: WindowManager }): void;
   loadGeneralSettings(): GeneralSettings;
@@ -162,10 +167,10 @@ export async function startCore(deps: CoreDependencies): Promise<CoreResult> {
   scheduler.initialize();
 
   // 插件严格晚于内置 adapter id 预留，避免插件抢占 feishu/wechat/qq 等内置 id。
-  const plugins = await timedStep("startPlugins", () => deps.startPlugins(services, scheduler));
+  const plugins = await timedStep("startPlugins", () => deps.startPlugins(services, scheduler, runtime));
 
   // 注册聊天渲染进程可能调用的全部 IPC 处理器 —— 必须先于 chat.load()
-  deps.registerCoreIpc({ ipc: shell.ipc, runtime, services, channels, scheduler });
+  await deps.registerCoreIpc({ ipc: shell.ipc, runtime, services, channels, scheduler });
 
   // 提醒中心装配：IPC 注册先于 toast 窗口预加载（渲染页加载即可能 invoke getAll）
   deps.wireToastCenter({ ipc: shell.ipc, windowManager: shell.windowManager });
@@ -173,24 +178,27 @@ export async function startCore(deps: CoreDependencies): Promise<CoreResult> {
   // 全部处理器就绪后才加载聊天页面；页面加载失败属于致命错误（向上抛出）
   await timedStep("chat-load", () => shell.chat.load());
 
-  // 桌宠：仅在设置开启时创建（不创建后隐藏、不闪现）；辅助窗口按设置创建
+  // 桌宠：窗口始终创建，petVisible 只决定是否显示（隐藏时不闪现）。
+  // 始终创建是为了保证托盘"显示/隐藏桌宠"与设置面板开关随时能把窗口救回来，
+  // 且 alwaysOnTop / zoom / live2d 生命周期在隐藏状态下同样完成接线。
   const generalSettings = deps.loadGeneralSettings();
-  // 启动期一次性应用通用设置（登录项同步等）；此时桌宠未创建，show/hide 为 no-op
+  // 启动期一次性完整应用通用设置（登录项同步等）；此时桌宠未创建，show/hide 为 no-op
   deps.applyGeneralSettings(generalSettings, services);
-  if (generalSettings.petVisible) {
-    // showOnReady=true：页面就绪才显示，避免空窗口闪现；创建本身在核心 IPC 注册之后
-    shell.windowManager.createPetWindow(true);
-    shell.windowManager.onPetWindowReady((win) => {
-      shell.live2dWindowLifecycle.attach(win);
-    });
-    shell.windowManager.onPetWindowClosed(() => {
-      shell.live2dWindowLifecycle.clear();
-    });
-    shell.windowManager.setPetWindowAlwaysOnTop(generalSettings.petAlwaysOnTop);
-    shell.windowManager.applyPetWindowZoom(generalSettings.petZoom);
-  }
-  if (generalSettings.sidebarVisible) shell.windowManager.createSidebarWindow();
-  if (generalSettings.tasksVisible) shell.windowManager.createTasksWindow();
+  // showOnReady=petVisible：页面就绪才显示，避免空窗口闪现；创建本身在核心 IPC 注册之后
+  const disclaimerAccepted = generalSettings.disclaimerAcceptedVersion === undefined
+    || generalSettings.disclaimerAcceptedVersion === CURRENT_DISCLAIMER_VERSION;
+  const onboardingWindow = disclaimerAccepted
+    ? null
+    : await shell.windowManager.createOnboardingWindow?.() ?? null;
+  shell.windowManager.createPetWindow(generalSettings.petVisible && disclaimerAccepted);
+  shell.windowManager.onPetWindowReady((win) => {
+    shell.live2dWindowLifecycle.attach(win);
+  });
+  shell.windowManager.onPetWindowClosed(() => {
+    shell.live2dWindowLifecycle.clear();
+  });
+  shell.windowManager.setPetWindowAlwaysOnTop(generalSettings.petAlwaysOnTop);
+  shell.windowManager.applyPetWindowZoom(generalSettings.petZoom);
 
   // 注册核心资源清理（固定阶段）；scheduler/proactive/更新定时器由 background 注册
   shutdown.register({
@@ -223,13 +231,25 @@ export async function startCore(deps: CoreDependencies): Promise<CoreResult> {
     phase: "stopLocalResources",
     dispose: async () => { await services.music.shutdown(); },
   });
+  shutdown.register({
+    id: "gmail-auth",
+    phase: "stopLocalResources",
+    dispose: async () => { await services.gmailAuth.shutdown(); },
+  });
+  shutdown.register({
+    id: "mail-attachments",
+    phase: "stopLocalResources",
+    dispose: async () => { services.mailAttachmentStore.clear(); },
+  });
 
   readiness.transition("core-ready");
 
-  // 等待最短展示剩余时长 → 关 Loading → 显示聊天 → 放行 pending 辅助窗口
+  // 等待最短展示时长 → 关闭 Loading → 显示欢迎窗或聊天主窗 → 放行启动期间的激活请求
   await deps.revealStartupWindows({
     splashWindow: shell.splashWindow,
     chatWindow: shell.chat.window,
+    onboardingWindow,
+    showOnboardingWindow: !disclaimerAccepted,
     loadingShownAt: shell.loadingShownAt,
     minimumDurationMs: deps.minimumSplashMs,
   });

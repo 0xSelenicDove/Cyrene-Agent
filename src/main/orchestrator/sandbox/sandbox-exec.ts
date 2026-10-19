@@ -41,6 +41,11 @@ let sandboxDisabled = false;
 let initAttempted = false;
 let sandboxSessionKey: string | null = null;
 
+/** ensure 连续失败上限：达到后本进程内不再重试，持续返回 not_ready（fail-closed） */
+const ENSURE_MAX_FAILURES = 3;
+let ensureFailCount = 0;
+let lastFailedSessionKey: string | null = null;
+
 // ── 环境开关 ────────────────────────────────────────────
 
 function isSrtDisabledByEnv(): boolean {
@@ -153,17 +158,20 @@ export function resolveSandboxSessionFilesystem(level: AgentFileAccessLevel, wor
 
 function buildSandboxConfig(level: AgentFileAccessLevel, workspaceRoot: string): SrtModule["SandboxRuntimeConfig"] {
   // 确保 allowWrite 目录存在（ACL grant 依赖）
-  try {
-    fs.mkdirSync(workspaceRoot, { recursive: true });
-  } catch (err) {
-    logger.warn(LogTag.Runtime, `[Sandbox] mkdir workspace root failed: ${workspaceRoot}`, err);
+  const filesystem = resolveSandboxSessionFilesystem(level, workspaceRoot);
+  for (const writableRoot of filesystem.allowWrite) {
+    try {
+      fs.mkdirSync(writableRoot, { recursive: true });
+    } catch (err) {
+      logger.warn(LogTag.Runtime, `[Sandbox] mkdir workspace root failed: ${writableRoot}`, err);
+    }
   }
   return {
     network: {
       allowedDomains: [],
       deniedDomains: [],
     },
-    filesystem: resolveSandboxSessionFilesystem(level, workspaceRoot),
+    filesystem,
     windows: {
       srtWin: { path: srtWinExePath ?? srtModule.VENDORED_SRT_WIN_EXE },
     },
@@ -176,7 +184,8 @@ function buildSandboxConfig(level: AgentFileAccessLevel, workspaceRoot: string):
  */
 async function initSandboxManager(level: AgentFileAccessLevel, cwd: string): Promise<void> {
   if (!srtModule) throw new Error("SRT module not loaded");
-  const workspaceRoot = level === "project-read-only" ? detectProjectRoot(cwd) : path.resolve(cwd);
+  // ensureSandboxReady 已确定可信根目录；这里不能再向上推断项目扩大范围。
+  const workspaceRoot = path.resolve(cwd);
   const config = buildSandboxConfig(level, workspaceRoot);
   logger.info(LogTag.Runtime, `[Sandbox] initSandboxManager: cwd=${cwd} allowWrite=${config.filesystem.allowWrite.join(",")} srtWin=${config.windows.srtWin.path}`);
   await srtModule.SandboxManager.initialize(config);
@@ -190,7 +199,7 @@ async function initSandboxManager(level: AgentFileAccessLevel, cwd: string): Pro
  * 启动时检测 SRT 安装状态。
  * - 装了 → 仅检查可用性；首次需要执行时才对实际工作区初始化 ACL
  * - 没装 → 留 not-ready（不主动安装，避免启动时弹 UAC）
- * - 出错 → 标记 disabled，fallback 到直接 spawn
+ * - 出错 → 只记录日志，保持 not-ready（fail-closed，不伪装成用户显式禁用）
  *
  * 幂等：重复调用安全（initAttempted 守卫）。
  * 在 main/index.ts registerAllTools 前调用。
@@ -230,8 +239,9 @@ export async function initSandbox(): Promise<void> {
     logger.info(LogTag.Runtime, "[Sandbox] provisioned; will initialize ACL for the active workspace on first sandboxed command");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.error(LogTag.Runtime, `[Sandbox] init failed, disabling: ${msg}`);
-    sandboxDisabled = true;
+    // 故障不伪装成"用户显式禁用"：保持 not_ready 语义（fail-closed），
+    // 否则 run_shell 会把初始化失败当成 disabled 而 read 类命令降级直跑
+    logger.error(LogTag.Runtime, `[Sandbox] init failed, staying not-ready: ${msg}`);
   }
 }
 
@@ -247,18 +257,22 @@ export function isSandboxReady(): boolean {
 /**
  * 确保沙箱就绪：未就绪时尝试 lazy install（可能弹 UAC）。
  * - 已就绪 → true
- * - 未安装 → installWindowsSandboxAsync（UAC），用户取消则返回 false（不 disable）
- * - 其他错误 → disable 并返回 false
+ * - 未安装 → installWindowsSandboxAsync（UAC），用户取消则返回 false（不计失败，下次还会再试）
+ * - 其他错误 → 返回 false 且保持 not_ready 语义（fail-closed）；
+ *   连续失败达到 ENSURE_MAX_FAILURES 次后本进程内不再重试，
+ *   更换工作区或档位（会话 key 变化）会重置计数重新尝试
  *
  * UAC 取消不算错误（用户可能只是这次不想装），下次还会再试。
  */
-export async function ensureSandboxReady(cwd: string = process.cwd()): Promise<boolean> {
+export async function ensureSandboxReady(cwd: string = process.cwd(), trustedWorkspaceRoot?: string): Promise<boolean> {
   if (sandboxDisabled || !isWindows()) {
     logger.info(LogTag.Runtime, `[Sandbox] ensureSandboxReady: skip (sandboxDisabled=${sandboxDisabled} isWindows=${isWindows()})`);
     return false;
   }
   const level = getCurrentLevel();
-  const workspaceRoot = level === "project-read-only" ? detectProjectRoot(cwd) : path.resolve(cwd);
+  const workspaceRoot = trustedWorkspaceRoot
+    ? fs.realpathSync.native(trustedWorkspaceRoot)
+    : level === "project-read-only" ? detectProjectRoot(cwd) : path.resolve(cwd);
   const desiredSessionKey = JSON.stringify({ level, workspaceRoot });
   if (sandboxReady && sandboxSessionKey === desiredSessionKey) {
     logger.info(LogTag.Runtime, "[Sandbox] ensureSandboxReady: already ready");
@@ -266,6 +280,18 @@ export async function ensureSandboxReady(cwd: string = process.cwd()): Promise<b
   }
   if (!srtModule || !srtWin) {
     logger.info(LogTag.Runtime, `[Sandbox] ensureSandboxReady: srtModule=${!!srtModule} srtWin=${!!srtWin}, cannot proceed`);
+    return false;
+  }
+
+  // 会话 key 变化（换工作区/档位）→ 恢复重试预算，重新给初始化机会
+  if (lastFailedSessionKey !== null && lastFailedSessionKey !== desiredSessionKey) {
+    ensureFailCount = 0;
+    lastFailedSessionKey = null;
+    logger.info(LogTag.Runtime, "[Sandbox] ensureSandboxReady: session key changed, retry budget restored");
+  }
+  // 连续失败达到上限：不再重试，保持 not_ready（fail-closed），避免每条命令都撞墙
+  if (ensureFailCount >= ENSURE_MAX_FAILURES) {
+    logger.warn(LogTag.Runtime, `[Sandbox] ensureSandboxReady: ${ensureFailCount} consecutive failures, stop retrying in this process (fail-closed)`);
     return false;
   }
 
@@ -289,12 +315,17 @@ export async function ensureSandboxReady(cwd: string = process.cwd()): Promise<b
     }
     await initSandboxManager(level, workspaceRoot);
     sandboxReady = true;
+    ensureFailCount = 0;
+    lastFailedSessionKey = null;
     logger.info(LogTag.Runtime, "[Sandbox] ready (lazy init)");
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.error(LogTag.Runtime, `[Sandbox] lazy init failed, disabling: ${msg}`);
-    sandboxDisabled = true;
+    // 初始化故障保持 not_ready 语义（fail-closed），不伪装成"用户显式禁用"，
+    // 否则 run_shell 会让 read 类命令绕过沙箱降级直跑
+    ensureFailCount += 1;
+    lastFailedSessionKey = desiredSessionKey;
+    logger.error(LogTag.Runtime, `[Sandbox] lazy init failed (${ensureFailCount}/${ENSURE_MAX_FAILURES}), staying not-ready: ${msg}`);
     return false;
   }
 }
@@ -323,7 +354,7 @@ export type SandboxWrapOutcome =
  *          调用方据此决定 fail-closed 还是降级（见 run-shell-tool.ts 的 ExecutionPlan）
  *
  * 流程：
- * 1. 沙箱未就绪 → 先 ensureSandboxReady(cwd)（可能弹 UAC，失败返回 not_ready）
+ * 1. 沙箱未就绪 → 用可信工作区初始化权限，cwd 只决定命令执行位置（失败返回 not_ready）
  * 2. 调 wrapWithSandboxArgv(command, binShell, customConfig, undefined, cwd)
  *    工作区读写权限已在初始化阶段授予；customConfig 仅承载本次命令的 deny 规则
  */
@@ -331,6 +362,7 @@ export async function wrapWithSandbox(
   command: string,
   cwd?: string,
   binShell?: string,
+  trustedWorkspaceRoot?: string,
 ): Promise<SandboxWrapOutcome> {
   const level = getCurrentLevel();
   logger.info(LogTag.Runtime, `[Sandbox] wrapWithSandbox: command="${command}" cwd=${cwd || "(undefined)"} level=${level}`);
@@ -347,7 +379,7 @@ export async function wrapWithSandbox(
   }
 
   const resolvedCwd = cwd || process.cwd();
-  const ready = await ensureSandboxReady(resolvedCwd);
+  const ready = await ensureSandboxReady(resolvedCwd, trustedWorkspaceRoot);
   if (!ready || !srtModule) {
     logger.info(LogTag.Runtime, `[Sandbox] wrapWithSandbox: sandbox not ready (ready=${ready} srtModule=${!!srtModule}), returning not_ready`);
     return { ok: false, reason: "not_ready", detail: `ready=${ready} srtModule=${!!srtModule}` };
@@ -355,13 +387,6 @@ export async function wrapWithSandbox(
 
   try {
     logger.info(LogTag.Runtime, `[Sandbox] wrapWithSandbox: command="${command}" resolvedCwd=${resolvedCwd}`);
-
-    // 确保 cwd 存在（ACL grant 依赖；mkdirSync recursive 是幂等的）
-    try {
-      fs.mkdirSync(resolvedCwd, { recursive: true });
-    } catch (err) {
-      logger.warn(LogTag.Runtime, `[Sandbox] wrapWithSandbox: mkdir cwd failed: ${resolvedCwd}`, err);
-    }
 
     // per-call customConfig：按当前权限档位选 fs 配置
     const customConfig = buildFilesystemConfigForLevel(resolvedCwd);

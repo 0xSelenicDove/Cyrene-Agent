@@ -28,9 +28,9 @@ export const runVerificationTool: ToolDefinition = {
     "- 需要运行测试确认修改正确\n" +
     "- 需要 lint 检查代码风格\n\n" +
     "不要用于：\n" +
-    "- 读取文件内容 → read_file\n" +
+    "- 读取文件内容 → Read\n" +
     "- 执行任意命令 → run_shell\n" +
-    "- 修改代码 → apply_patch/str_replace/write_file\n\n" +
+    "- 修改代码 → Edit/Write\n\n" +
     "参数：verificationType（验证类型：typecheck/test/build/lint），cwd（可选工作目录）。",
   enabled: true,
   risk: "shell",
@@ -225,7 +225,7 @@ export const runVerificationTool: ToolDefinition = {
         source: command.source,
       }, {
         // 仅在工具真实执行时读取宿主档位；模块加载阶段保持 VerificationRunner 纯净。
-        permissionLevel: (await import("../../../permission")).getCurrentLevel(),
+        permissionLevel: (await import("../../../permission.js")).getCurrentLevel(),
         signal: undefined,
       });
 
@@ -283,4 +283,3 @@ export const runVerificationTool: ToolDefinition = {
     }
   },
 };
-

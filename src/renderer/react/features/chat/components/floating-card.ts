@@ -1,23 +1,33 @@
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type RefObject } from "react";
 
 export interface FloatingCardPosition { x: number; y: number }
 
 export function clampFloatingCardPosition(
   position: FloatingCardPosition,
-  card: { width: number; minVisibleHeight: number },
+  card: { width: number; minVisibleHeight: number; minTop?: number },
   viewport: { width: number; height: number },
 ): FloatingCardPosition {
+  const minTop = Math.min(Math.max(0, card.minTop ?? 0), Math.max(0, viewport.height - card.minVisibleHeight));
   return {
     x: Math.min(Math.max(0, position.x), Math.max(0, viewport.width - card.width)),
-    y: Math.min(Math.max(0, position.y), Math.max(0, viewport.height - card.minVisibleHeight)),
+    y: Math.min(Math.max(minTop, position.y), Math.max(minTop, viewport.height - card.minVisibleHeight)),
   };
 }
 
-export function useFloatingCard(options: { width: number; top?: number; right?: number }) {
-  const { width, top = 80, right = 24 } = options;
+export function useFloatingCard(options: { width: number; top?: number; right?: number; containerRef?: RefObject<HTMLElement | null> }) {
+  const { width, top = 80, right = 24, containerRef } = options;
+  const getViewport = () => {
+    const container = containerRef?.current;
+    return container
+      ? { width: container.clientWidth, height: container.clientHeight }
+      : { width: window.innerWidth, height: window.innerHeight };
+  };
+  const getMinTop = () => containerRef?.current
+    ?.querySelector<HTMLElement>(".cy-workspace-titlebar")
+    ?.offsetHeight ?? 0;
   const [collapsed, setCollapsed] = useState(false);
   const [position, setPosition] = useState<FloatingCardPosition>({
-    x: typeof window !== "undefined" ? window.innerWidth - width - right : 0,
+    x: typeof window !== "undefined" ? getViewport().width - width - right : 0,
     y: top,
   });
   const [isDragging, setIsDragging] = useState(false);
@@ -27,6 +37,25 @@ export function useFloatingCard(options: { width: number; top?: number; right?: 
     initialX: number;
     initialY: number;
   } | null>(null);
+
+  useLayoutEffect(() => {
+    if (!containerRef?.current) return;
+    const container = containerRef.current;
+    const updateBounds = () => {
+      const viewport = getViewport();
+      setPosition((current) => clampFloatingCardPosition(current, {
+        width,
+        minVisibleHeight: 48,
+        minTop: getMinTop(),
+      }, viewport));
+    };
+    updateBounds();
+    const observer = new ResizeObserver(updateBounds);
+    observer.observe(container);
+    const titlebar = container.querySelector<HTMLElement>(".cy-workspace-titlebar");
+    if (titlebar) observer.observe(titlebar);
+    return () => observer.disconnect();
+  }, [containerRef, width]);
 
   useEffect(() => {
     const handleMove = (event: MouseEvent) => {
@@ -38,10 +67,11 @@ export function useFloatingCard(options: { width: number; top?: number; right?: 
       setPosition(clampFloatingCardPosition({
         x: drag.initialX + dx,
         y: drag.initialY + dy,
-      }, { width, minVisibleHeight: 48 }, {
-        width: window.innerWidth,
-        height: window.innerHeight,
-      }));
+      }, {
+        width,
+        minVisibleHeight: 48,
+        minTop: getMinTop(),
+      }, getViewport()));
     };
     const handleUp = () => {
       dragRef.current = null;
@@ -53,7 +83,7 @@ export function useFloatingCard(options: { width: number; top?: number; right?: 
       window.removeEventListener("mousemove", handleMove);
       window.removeEventListener("mouseup", handleUp);
     };
-  }, [width]);
+  }, [containerRef, width]);
 
   return {
     collapsed,

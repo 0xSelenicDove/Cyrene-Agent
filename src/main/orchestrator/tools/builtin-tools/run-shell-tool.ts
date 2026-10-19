@@ -9,9 +9,13 @@
 // 门禁见 built-in-tools.snapshot.test.ts）。
 
 import { spawn } from "child_process";
+import * as path from "node:path";
+import * as fs from "node:fs";
 import type { ToolDefinition } from "../registry/tool-registry";
+import type { ShellOutputUpdate } from "../registry/tool-context";
+import { SHELL_VISIBLE_OUTPUT_LIMIT } from "../../../../shared/shell-output";
 import { wrapWithSandbox, type SandboxWrapOutcome } from "../../sandbox/sandbox-exec";
-import { getCurrentLevel } from "../../../permission";
+import { getFileAccessLevel, resolveFileAccessPath } from "../file-access";
 import { classifyShellEffect, isCatastrophicCommand, type ShellEffect } from "../../shell-execution-policy";
 import { logger, LogTag } from "../../../logger";
 import {
@@ -49,6 +53,7 @@ const SHELL_KILL_GRACE_MS = 2_000;
 // 不会过早截断；超限的 chunk 丢弃并标记 captureTruncated=true（数据真实丢失，
 // 与 dispatcher 侧"数据完整、仅视图裁剪"的 truncatedForModel 是两个不同事实）。
 const SHELL_CAPTURE_LIMIT_PER_STREAM = 2 * 1024 * 1024;
+const SHELL_OUTPUT_FLUSH_MS = 100;
 
 // ── Shell 输出解码 ─────────────────────────────────────
 // 中文 Windows 的 cmd.exe 按系统 OEM 码页（GBK/CP936）输出（dir/echo/del 等内建命令），
@@ -78,6 +83,40 @@ function decodeShellOutput(chunks: Buffer[]): string {
     }
     return buf.toString("utf8");
   }
+}
+
+type CapturedShellChunk = { stream: "stdout" | "stderr"; bytes: Buffer };
+
+/** 最终预览按每条流分别判定编码，再按数据抵达顺序重建。 */
+function decodeOrderedShellOutput(
+  ordered: CapturedShellChunk[],
+  stdoutChunks: Buffer[],
+  stderrChunks: Buffer[],
+): string {
+  const encoding = (chunks: Buffer[]): string => {
+    try {
+      utf8StrictDecoder.decode(Buffer.concat(chunks));
+      return "utf-8";
+    } catch {
+      return gbkDecoder ? "gbk" : "utf-8";
+    }
+  };
+  const decoders = {
+    stdout: new TextDecoder(encoding(stdoutChunks)),
+    stderr: new TextDecoder(encoding(stderrChunks)),
+  };
+  let result = "";
+  for (const entry of ordered) {
+    result += decoders[entry.stream].decode(entry.bytes, { stream: true });
+  }
+  return result + decoders.stdout.decode() + decoders.stderr.decode();
+}
+
+function visibleOutputTail(value: string): string {
+  if (value.length <= SHELL_VISIBLE_OUTPUT_LIMIT) return value;
+  const tail = value.slice(-SHELL_VISIBLE_OUTPUT_LIMIT);
+  // 不从 UTF-16 代理对的后半字符开始截取。
+  return /^[\uDC00-\uDFFF]/u.test(tail) ? tail.slice(1) : tail;
 }
 
 // ── 超时策略 ─────────────────────────────────────────────
@@ -168,6 +207,7 @@ async function resolveExecutionPlan(
   requestedShell: ShellKind,
   resolvedShell: ResolvedShellExecutable,
   requiresSandbox: boolean,
+  trustedWorkspaceRoot?: string,
 ): Promise<ExecutionPlan> {
   const base = { command, cwd, requestedShell };
   let outcome: SandboxWrapOutcome;
@@ -176,6 +216,7 @@ async function resolveExecutionPlan(
       command,
       cwd,
       requestedShell === "bash" ? resolvedShell.executable : undefined,
+      trustedWorkspaceRoot,
     );
   } catch (err) {
     // 契约上 wrapWithSandbox 永不抛错；此处兜底防止 API 破约重新打开 fail-open 缺口
@@ -242,6 +283,7 @@ function executePlan(
   resolvedShell: ResolvedShellExecutable,
   signal?: AbortSignal,
   timeoutPolicy: ShellTimeoutPolicy = DEFAULT_TIMEOUT_POLICY,
+  onOutput?: (update: ShellOutputUpdate) => void,
 ): Promise<ShellResult> {
   return new Promise((resolve) => {
     (async () => {
@@ -269,9 +311,40 @@ function executePlan(
       // Buffer 原样累积（每流 2MB 上限），进程结束时按 UTF-8→GBK 顺序解码（见 decodeShellOutput）
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
+      const orderedChunks: CapturedShellChunk[] = [];
       let stdoutBytes = 0;
       let stderrBytes = 0;
       let captureTruncated = false;
+      const liveDecoders = {
+        stdout: new TextDecoder("utf-8"),
+        stderr: new TextDecoder("utf-8"),
+      };
+      let pendingOutput = "";
+      let liveOutputTruncated = false;
+      let outputTimer: NodeJS.Timeout | undefined;
+      const publishOutput = (update: ShellOutputUpdate) => {
+        try { onOutput?.(update); } catch { /* 界面观察者不得中断进程 */ }
+      };
+      const flushOutput = () => {
+        outputTimer = undefined;
+        if (!pendingOutput) return;
+        publishOutput({
+          action: "append",
+          text: pendingOutput,
+          ...(liveOutputTruncated ? { truncated: true } : {}),
+        });
+        pendingOutput = "";
+        liveOutputTruncated = false;
+      };
+      const queueOutput = (stream: "stdout" | "stderr", bytes: Buffer) => {
+        if (!onOutput || bytes.length === 0) return;
+        pendingOutput += liveDecoders[stream].decode(bytes, { stream: true });
+        if (pendingOutput.length > SHELL_VISIBLE_OUTPUT_LIMIT) {
+          pendingOutput = visibleOutputTail(pendingOutput);
+          liveOutputTruncated = true;
+        }
+        if (!outputTimer) outputTimer = setTimeout(flushOutput, SHELL_OUTPUT_FLUSH_MS);
+      };
 
       // ── 双计时器 + 强制收尸 ──────────────────────────────
       // settled 保证只 resolve 一次；close/error/强制收尸任何一方先到都安全。
@@ -288,6 +361,15 @@ function executePlan(
         if (settled) return;
         settled = true;
         clearTimers();
+        clearTimeout(outputTimer);
+        if (onOutput) {
+          const corrected = decodeOrderedShellOutput(orderedChunks, stdoutChunks, stderrChunks);
+          publishOutput({
+            action: "replace",
+            text: visibleOutputTail(corrected),
+            ...(captureTruncated || corrected.length > SHELL_VISIBLE_OUTPUT_LIMIT ? { truncated: true } : {}),
+          });
+        }
         if (signal) signal.removeEventListener("abort", onAbort);
         resolve(result);
       };
@@ -353,24 +435,34 @@ function executePlan(
       }
 
       child.stdout?.on("data", (chunk: Buffer) => {
+        if (settled) return;
         resetIdle();
-        if (stdoutBytes >= SHELL_CAPTURE_LIMIT_PER_STREAM) {
+        const remaining = SHELL_CAPTURE_LIMIT_PER_STREAM - stdoutBytes;
+        if (remaining <= 0) {
           captureTruncated = true;
           return;
         }
-        stdoutChunks.push(chunk);
-        stdoutBytes += chunk.length;
-        if (stdoutBytes > SHELL_CAPTURE_LIMIT_PER_STREAM) captureTruncated = true;
+        const accepted = chunk.subarray(0, remaining);
+        stdoutChunks.push(accepted);
+        orderedChunks.push({ stream: "stdout", bytes: accepted });
+        stdoutBytes += accepted.length;
+        if (accepted.length < chunk.length) captureTruncated = true;
+        queueOutput("stdout", accepted);
       });
       child.stderr?.on("data", (chunk: Buffer) => {
+        if (settled) return;
         resetIdle();
-        if (stderrBytes >= SHELL_CAPTURE_LIMIT_PER_STREAM) {
+        const remaining = SHELL_CAPTURE_LIMIT_PER_STREAM - stderrBytes;
+        if (remaining <= 0) {
           captureTruncated = true;
           return;
         }
-        stderrChunks.push(chunk);
-        stderrBytes += chunk.length;
-        if (stderrBytes > SHELL_CAPTURE_LIMIT_PER_STREAM) captureTruncated = true;
+        const accepted = chunk.subarray(0, remaining);
+        stderrChunks.push(accepted);
+        orderedChunks.push({ stream: "stderr", bytes: accepted });
+        stderrBytes += accepted.length;
+        if (accepted.length < chunk.length) captureTruncated = true;
+        queueOutput("stderr", accepted);
       });
       child.on("error", (err) => {
         finish(buildResult(-1, err.message));
@@ -398,7 +490,9 @@ function executePlan(
 
 async function executeRunShell(args: Record<string, unknown>, context?: import("../registry/tool-context").ToolContext): Promise<string> {
   const command = String(args.command || "").trim();
-  const cwd = args.cwd ? String(args.cwd) : undefined;
+  let cwd = args.cwd
+    ? path.resolve(context?.resolvedWorkspaceRoot ?? process.cwd(), String(args.cwd))
+    : context?.resolvedWorkspaceRoot;
   // timeout_ms 显式 deadline：钳制 + 禁用 idle 检测（解析规则见 resolveTimeoutPolicy）
   const timeoutPolicy = resolveTimeoutPolicy(args.timeout_ms);
   if (timeoutPolicy.explicitDeadline) {
@@ -428,8 +522,25 @@ async function executeRunShell(args: Record<string, unknown>, context?: import("
     });
   }
 
-  const level = context?.permissionMode === "allow_all" ? "full" : getCurrentLevel();
+  const level = getFileAccessLevel(context);
   const effect: ShellEffect = classifyShellEffect(command);
+  if (cwd) {
+    const access = resolveFileAccessPath(cwd, "read", context);
+    if (!access.ok) {
+      return JSON.stringify({
+        success: false, errorCode: "PERMISSION_DENIED", category: "permission_denied",
+        command, cwd, shell: requestedShell, exitCode: -1, timedOut: false,
+        captureTruncated: false, effect, sandboxed: false, stderr: `[拒绝] ${access.message}`, stdout: "",
+      });
+    }
+    cwd = access.path;
+    try {
+      if (!fs.statSync(cwd).isDirectory()) throw new Error("不是目录");
+    } catch {
+      return JSON.stringify({ success: false, errorCode: "INVALID_CWD", category: "invalid_arguments",
+        error: `工作目录不存在或无法访问：${cwd}` });
+    }
+  }
   logger.info(LogTag.BuiltinTools, `[run_shell] entry: command="${command}" cwd=${cwd || "(undefined)"} effect=${effect} level=${level}`);
 
   // 解释器前置解析：直跑和沙箱包装都需要（bash 不可用在此提前返回，不进入执行计划）
@@ -450,7 +561,7 @@ async function executeRunShell(args: Record<string, unknown>, context?: import("
   if (args.run_in_background === true || args.run_in_background === "true") {
     const plan: ExecutionPlan = level === "full"
       ? { kind: "direct", command, cwd, requestedShell }
-      : await resolveExecutionPlan(command, cwd, requestedShell, resolvedShell, requiresSandbox);
+      : await resolveExecutionPlan(command, cwd, requestedShell, resolvedShell, requiresSandbox, context?.resolvedWorkspaceRoot);
     if (plan.kind === "rejected") {
       // 与前台一致的拒绝协议：spawn 从未被调用，stdout 必然为空
       return JSON.stringify({
@@ -460,8 +571,8 @@ async function executeRunShell(args: Record<string, unknown>, context?: import("
       });
     }
     const spec = buildSpawnSpec(plan, resolvedShell);
-    const { jobId, logFile } = startShellJob({
-      spec, command, shell: requestedShell, totalMs: timeoutPolicy.totalMs,
+    const { jobId, logFile } = await startShellJob({
+      spec, command, shell: requestedShell, totalMs: timeoutPolicy.totalMs, signal: context?.signal,
     });
     logger.info(LogTag.BuiltinTools, `[run_shell] background ${jobId} started: command="${command}" totalMs=${timeoutPolicy.totalMs}`);
     return JSON.stringify({
@@ -479,7 +590,7 @@ async function executeRunShell(args: Record<string, unknown>, context?: import("
   // full 档位：直接 spawn，不走沙箱（用户已选择完全信任）
   if (level === "full") {
     logger.info(LogTag.BuiltinTools, `[run_shell] full level → direct ${requestedShell} (no sandbox)`);
-    const result = await executePlan({ kind: "direct", command, cwd, requestedShell }, resolvedShell, context?.signal, timeoutPolicy);
+    const result = await executePlan({ kind: "direct", command, cwd, requestedShell }, resolvedShell, context?.signal, timeoutPolicy, context?.onShellOutput);
     logger.info(LogTag.BuiltinTools, `[run_shell] [full] done: exitCode=${result.exitCode} timedOut=${result.timedOut} stdout.len=${result.stdout.length} stderr.len=${result.stderr.length}`);
     // 字段顺序契约：stdout 排最后（command/cwd 等短字段之后），保证下游截断的
     // 尾窗始终覆盖 stdout 末尾——测试/构建命令的汇总行（Test Files/Tests passed）就在那里。
@@ -499,7 +610,7 @@ async function executeRunShell(args: Record<string, unknown>, context?: import("
   // - read  → 仅当"用户显式无沙箱"（reason: disabled）时允许 direct 降级
   // - write/unknown → 必须 wrap 成功，否则 rejected（fail-closed，不执行）
   // （requiresSandbox 已在后台分支前声明，此处复用）
-  const plan = await resolveExecutionPlan(command, cwd, requestedShell, resolvedShell, requiresSandbox);
+  const plan = await resolveExecutionPlan(command, cwd, requestedShell, resolvedShell, requiresSandbox, context?.resolvedWorkspaceRoot);
 
   if (plan.kind === "rejected") {
     // 到达这里时 spawn 从未被调用——命令没有执行过，stdout 必然为空
@@ -510,7 +621,7 @@ async function executeRunShell(args: Record<string, unknown>, context?: import("
     });
   }
 
-  const result = await executePlan(plan, resolvedShell, context?.signal, timeoutPolicy);
+  const result = await executePlan(plan, resolvedShell, context?.signal, timeoutPolicy, context?.onShellOutput);
   logger.info(LogTag.BuiltinTools, `[run_shell] [${level}] done: exitCode=${result.exitCode} timedOut=${result.timedOut} stdout.len=${result.stdout.length} stderr.len=${result.stderr.length} sandboxed=${result.ranViaSandbox}`);
   // 字段顺序契约同 full 档位：stdout 置尾，保证尾窗覆盖汇总行
   return JSON.stringify({
@@ -527,6 +638,7 @@ async function executeRunShell(args: Record<string, unknown>, context?: import("
 
 export const runShellTool: ToolDefinition = {
   id: "run_shell",
+  needsContext: true,
   name: "执行命令",
   description:
     "在用户电脑上执行一条 Shell 命令字符串。默认由 cmd.exe 解析；需要类 Unix 语法时可显式选择 bash。返回 exitCode + stdout + stderr。\n\n" +
@@ -547,9 +659,9 @@ export const runShellTool: ToolDefinition = {
     "- 需要管道/重定向组合的命令\n" +
     "- 建目录/建文件等文件工具做不到时的兜底（如 mkdir、echo 内容 > 文件、type nul > 新建空文件）\n\n" +
     "不要用于：\n" +
-    "- 读文件 → read_file（更安全）\n" +
-    "- 列目录 → list_dir\n" +
-    "- 搜索代码内容 → search_text\n" +
+    "- 读文件 → Read（更安全）\n" +
+    "- 查找文件名 → Glob\n" +
+    "- 搜索文件内容 → Grep\n" +
     "- 下载网页 → fetch_url\n" +
     "- 启动常驻进程（dev server / npx serve / watch / tail -f）→ 前台模式会在 2 分钟无输出后被强制终止，" +
     "确需后台长驻时传 run_in_background:true，随后用 shell_job 工具查询状态/终止\n" +
@@ -593,4 +705,3 @@ export const runShellTool: ToolDefinition = {
   },
   execute: executeRunShell,
 };
-

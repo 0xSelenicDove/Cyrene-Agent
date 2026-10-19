@@ -5,10 +5,12 @@
  */
 
 import type { WindowActivationBroker } from "./window-activation";
+import type { LegacyUserDataMigrationResult } from "../user-data-migration";
 
 export interface PreReadyDependencies {
-  configureDocumentIndex(): void;
   installSingleInstance(onSecondInstance: () => void): boolean;
+  /** 旧 userData 目录（live2d-cyrene）数据迁移到当前目录（Cyrene）。 */
+  migrateLegacyUserData(): LegacyUserDataMigrationResult;
   registerPrivilegedSchemes(): void;
   configureGpuSwitches(): void;
   ensureGpuSandboxAcl(): void;
@@ -21,13 +23,19 @@ export interface PreReadyResult {
 }
 
 export function prepareBeforeReady(deps: PreReadyDependencies): PreReadyResult {
-  deps.configureDocumentIndex();
 
   const isPrimary = deps.installSingleInstance(() => {
     deps.activation.request({ kind: "chat" });
   });
   if (!isPrimary) {
     return { isPrimaryProcess: false };
+  }
+
+  // 数据迁移必须在单实例锁之后（防并发搬运）、
+  // 下方 GPU 开关读取设置之前（那是 userData 的第一处读取点）
+  const migration = deps.migrateLegacyUserData();
+  if (migration.status === "failed" || migration.status === "partial") {
+    throw new Error("用户数据迁移未完成，已停止启动以避免使用不完整的数据目录。请关闭其他 Cyrene 实例及占用数据文件的程序后重试；不要删除旧数据目录。");
   }
 
   deps.registerPrivilegedSchemes();

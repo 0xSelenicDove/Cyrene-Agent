@@ -14,6 +14,7 @@ import { logger, LogTag } from "../../logger";
 import { ToolExecutionError } from "./registry/tool-execution-error";
 import { app } from "electron";
 import { getRunReviewTracker } from "../review/run-review-tracker";
+import { resolveFileAccessPath } from "./file-access";
 
 const LOG_PREFIX = "[FsTools]";
 
@@ -43,13 +44,16 @@ function humanBytes(n: number): string {
 
 // ── 工具 1：read_file ─────────────────────────────────────
 
-async function executeReadFile(args: Record<string, unknown>): Promise<string> {
+async function executeReadFile(args: Record<string, unknown>, ctx?: ToolContext): Promise<string> {
   const raw = String(args.path || "").trim();
-  const filePath = ensureAbsolute(raw);
+  let filePath = ensureAbsolute(raw);
   if (!filePath) {
     console.log(LOG_PREFIX, "read_file 非绝对路径:", raw, "cwd=", process.cwd());
     return JSON.stringify({ success: false, errorCode: "INVALID_PATH", error: "path 必须是绝对路径: " + raw, retryable: false });
   }
+  const access = resolveFileAccessPath(filePath, "read", ctx);
+  if (!access.ok) return JSON.stringify({ success: false, errorCode: "PERMISSION_DENIED", category: "permission_denied", error: access.message, retryable: false });
+  filePath = access.path;
 
   const stat = safeStat(filePath);
   if (!stat) {
@@ -57,7 +61,7 @@ async function executeReadFile(args: Record<string, unknown>): Promise<string> {
     return JSON.stringify({
       success: false,
       errorCode: "FILE_NOT_FOUND",
-      error: "文件不存在或无法访问: " + filePath + "。不要重复读取相同路径，请先用 search_text 或 list_dir 重新定位文件。",
+      error: "文件不存在或无法访问: " + filePath + "。不要重复读取相同路径，请先用 Grep 或 Glob 重新定位文件。",
       retryable: true,
     });
   }
@@ -82,7 +86,7 @@ async function executeReadFile(args: Record<string, unknown>): Promise<string> {
     return JSON.stringify({
       success: false,
       errorCode: "FILE_TOO_LARGE",
-      error: `文件超过 ${humanBytes(READ_MAX_BYTES)}（当前 ${humanBytes(stat.size)}），read_file 暂不支持读取。可用 search_text 直接获取匹配行的上下文。`,
+      error: `文件超过 ${humanBytes(READ_MAX_BYTES)}（当前 ${humanBytes(stat.size)}），Read 暂不支持读取。可用 Grep 获取匹配行的上下文。`,
       path: filePath,
       size: humanBytes(stat.size),
       retryable: false,
@@ -97,7 +101,7 @@ async function executeReadFile(args: Record<string, unknown>): Promise<string> {
     return JSON.stringify({
       success: false,
       errorCode: "BINARY_FILE",
-      error: "这看起来是二进制文件，read_file 只支持文本。如果是图片，请改用 read_image。",
+      error: "这看起来是二进制文件，Read 只支持文本和图片。如果是图片，请直接用 Read 读取。",
       path: filePath,
       size: humanBytes(stat.size),
       retryable: false,
@@ -161,10 +165,14 @@ toolRegistry.register({
     "- 凭印象猜内容（绝对不行，必须先 read）\n" +
     "- 读图片 → read_image\n" +
     "- 列目录 → list_dir\n\n" +
+    "用户本轮附加文件时，会提供绝对路径；读取附件必须先调用本工具。\n" +
     "参数：path (必填，绝对路径)，startLine (可选，默认 1)，maxLines (可选，默认 500)。",
   enabled: true,
   risk: "fs-read",
-  modes: ["learn", "code", "work"],
+  modes: ["chat", "learn", "code", "work"],
+  chatBuiltin: true,
+  requiresFileAttachments: true,
+  needsContext: true,
   effectKind: "read" as const,
   // 只读同步文件读取；不会改工作区或 Harness 父状态。
   isConcurrencySafe: () => true,
@@ -183,10 +191,13 @@ toolRegistry.register({
 
 // ── 工具 2：list_dir ──────────────────────────────────────
 
-async function executeListDir(args: Record<string, unknown>): Promise<string> {
+async function executeListDir(args: Record<string, unknown>, ctx?: ToolContext): Promise<string> {
   const raw = String(args.path || "").trim();
-  const dirPath = ensureAbsolute(raw);
+  let dirPath = ensureAbsolute(raw);
   if (!dirPath) return "[错误] path 必须是绝对路径";
+  const access = resolveFileAccessPath(dirPath, "read", ctx);
+  if (!access.ok) return "[拒绝] " + access.message;
+  dirPath = access.path;
 
   const stat = safeStat(dirPath);
   if (!stat) return "[错误] 目录不存在或无法访问: " + dirPath;
@@ -266,6 +277,7 @@ toolRegistry.register({
     "- 用户给了完整文件路径 → 直接 read_file\n\n" +
     "参数：path (必填，绝对路径)，showHidden (可选，是否显示以 . 开头的隐藏项，默认 false)。",
   enabled: true,
+  needsContext: true,
   risk: "fs-read",
   modes: ["learn", "code", "work"],
   effectKind: "read" as const,
@@ -285,27 +297,48 @@ toolRegistry.register({
 
 // ── 工具 3：write_file ────────────────────────────────────
 
+/**
+ * 解析写入路径：绝对路径照旧；相对路径收编自原 write_markdown——
+ * 根目录固定为可信工作区（未绑定时回退桌面），禁止 .. 穿越和前缀碰撞绕过。
+ * 返回绝对路径，或 null 表示校验失败。
+ */
+function resolveWritePath(rawPath: string, workspaceRoot?: string): string | null {
+  if (path.isAbsolute(rawPath)) return path.normalize(rawPath);
+  const normalized = path.normalize(rawPath).replace(/\\/g, "/");
+  // 相对路径禁止目录穿越
+  if (normalized.includes("..")) return null;
+  const outputRoot = path.resolve(workspaceRoot || app.getPath("desktop"));
+  const fullPath = path.resolve(outputRoot, normalized);
+  const relative = path.relative(outputRoot, fullPath);
+  // 最终校验：必须仍在根目录下，不能靠前缀碰撞绕过
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+  return fullPath;
+}
+
 async function executeWriteFile(args: Record<string, unknown>, ctx?: ToolContext): Promise<string> {
   const raw = String(args.path || "").trim();
-  const filePath = ensureAbsolute(raw);
+  let filePath = resolveWritePath(raw, ctx?.resolvedWorkspaceRoot);
   if (!filePath) {
     throw new ToolExecutionError(
       "E_PATH_NOT_ABSOLUTE",
-      "path 必须是绝对路径",
+      "path 必须是绝对路径，或不含 .. 的相对文件名（相对路径以工作区/桌面为根）",
       "invalid_arguments",
     );
   }
+  const access = resolveFileAccessPath(filePath, "write", ctx);
+  if (!access.ok) throw new ToolExecutionError("E_FILE_ACCESS_DENIED", access.message, "permission_denied");
+  filePath = access.path;
 
   const content = typeof args.content === "string" ? args.content : "";
   const append = args.append === true;
   const createDirs = args.createDirs !== false; // 默认创建父目录
   const existedBefore = fs.existsSync(filePath);
 
-  // 覆盖写防护：写前现读当前文件，同一份内容同时用于骤降检查（软截断检测）
-  // 与行级 diff 生成。不走 review 基线——基线是本 run 第一次修改前的状态，
-  // 本轮早前可能已改过该文件，用基线会把骤降口径和 diff 都算错。
+  // 写前现读当前文件，同一份内容用于三处：骤降检查（软截断检测，仅覆盖写）、
+  // 行级 diff 生成、追加写补换行。不走 review 基线——基线是本 run 第一次修改
+  // 前的状态，本轮早前可能已改过该文件，用基线会把骤降口径和 diff 都算错。
   let existingContent: string | null = null;
-  if (!append && existedBefore) {
+  if (existedBefore) {
     try {
       existingContent = fs.readFileSync(filePath, "utf8");
     } catch (err) {
@@ -316,16 +349,18 @@ async function executeWriteFile(args: Record<string, unknown>, ctx?: ToolContext
         "permission_denied",
       );
     }
-    const drop = checkOverwriteDrop(existingContent, content);
-    if (drop.blocked) {
-      // 拒绝发生在落盘之前，文件保持原样
-      throw new ToolExecutionError(
-        "E_OVERWRITE_DROP_BLOCKED",
-        overwriteDropMessage(drop),
-        "runtime_safety",
-        false,
-        "not_applied",
-      );
+    if (!append) {
+      const drop = checkOverwriteDrop(existingContent, content);
+      if (drop.blocked) {
+        // 拒绝发生在落盘之前，文件保持原样
+        throw new ToolExecutionError(
+          "E_OVERWRITE_DROP_BLOCKED",
+          overwriteDropMessage(drop),
+          "runtime_safety",
+          false,
+          "not_applied",
+        );
+      }
     }
   }
 
@@ -352,7 +387,9 @@ async function executeWriteFile(args: Record<string, unknown>, ctx?: ToolContext
 
   try {
     if (append) {
-      fs.appendFileSync(filePath, content, "utf8");
+      // 追加写：原文件末尾缺换行时补一个，避免两段内容粘在同一行
+      const needsNewline = existingContent !== null && existingContent.length > 0 && !existingContent.endsWith("\n");
+      fs.appendFileSync(filePath, (needsNewline ? "\n" : "") + content, "utf8");
     } else {
       fs.writeFileSync(filePath, content, "utf8");
     }
@@ -424,7 +461,7 @@ function resolveWriteFilePolicy(args: Record<string, unknown>): VerificationPoli
   // 配置文件名 -> code（精确匹配）
   const codeConfigFiles = new Set([
     "package.json", "tsconfig.json", "tsconfig.main.json", "tsconfig.preload.json",
-    "vite.config.ts", "vite.config.js", "vitest.config.ts",
+    "vite.config.ts", "vite.config.mts", "vite.config.js", "vitest.config.ts", "vitest.config.mts",
     ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".prettierrc",
     "babel.config.js", "babel.config.json", "webpack.config.js",
   ]);
@@ -454,25 +491,30 @@ toolRegistry.register({
   name: "写入文件",
   description:
     "把文本内容写入本地文件，覆盖或追加。会自动创建父目录。\n" +
-    "覆盖已有大文件时若新内容行数骤降过半会被拒绝（防输出截断毁文件），此时改用 str_replace 做局部修改。\n\n" +
+    "覆盖已有大文件时若新内容行数骤降过半会被拒绝（防输出截断毁文件），此时改用 str_replace 做局部修改。\n" +
+    "笔记很长时不要一次性写入：先写前半部分，再用 append=true 续写后半部分。\n\n" +
     "何时用：\n" +
     "- 用户要保存生成的笔记、改写后的文本、配置\n" +
+    "- 用户要写笔记 / 纯文本文件（.md / .txt）\n" +
     "- 用户要新建文件\n" +
     "- 需要持久化一段内容到磁盘\n\n" +
     "不要用于：\n" +
     "- 修改已有文件的局部内容（用 str_replace/apply_patch 更安全）\n" +
-    "- 生成 Excel/Word/PDF/Markdown 文档（用对应专用工具）\n" +
+    "- 生成 Excel/Word/PDF 文档（用对应专用工具）\n" +
     "- 写入危险系统路径\n\n" +
-    "参数：path (绝对路径)，content (要写的字符串)，append (可选，true=追加，默认 false=覆盖)，createDirs (可选，默认 true)。",
+    "path 两种给法：绝对路径；或相对文件名（可含子目录，如 '笔记.md'、'test/report.md'）——" +
+    "绑定项目时落到项目根目录，未绑定时落到桌面。\n" +
+    "参数：path，content (要写的字符串)，append (可选，true=追加，默认 false=覆盖)，createDirs (可选，默认 true)。",
   enabled: true,
+  needsContext: true,
   risk: "fs-write",
-  modes: ["code", "work"],
+  modes: ["learn", "code", "work"],
   effectKind: "mutation" as const,
   verificationPolicyResolver: resolveWriteFilePolicy,
   inputSchema: {
     type: "object",
     properties: {
-      path: { type: "string", description: "目标文件绝对路径" },
+      path: { type: "string", description: "目标文件绝对路径，或相对文件名（可含子目录，如 '笔记.md'；绑定项目时落到项目根目录，未绑定时落到桌面）" },
       content: { type: "string", description: "要写入的文本内容（UTF-8）" },
       append: { type: "boolean", description: "true=追加，false=覆盖（默认）" },
       createDirs: { type: "boolean", description: "是否自动创建父目录，默认 true" },
@@ -486,11 +528,13 @@ toolRegistry.register({
 // 资源访问层：读图片→base64→交 vision-captioner 看图→返回文字。
 // 不懂视觉，看图的活外包给 captioner。
 
-// loadVisionConfig 已迁出到 settings/model-settings，但本文件仍被 index.ts 副作用注册。
-// 用懒加载规避：运行时才 require，此时相关模块已初始化完。
-function loadVisionConfigLazy() {
-  const mod = require("../../settings/model-settings") as { loadVisionConfig: () => import("../vision-captioner").VisionConfig | null };
-  return mod.loadVisionConfig();
+// 懒加载图片转述视觉配置：动态 import，规避注册期副作用。
+// 路由判定收口在 image-router（全项目唯一），本文件不再自行判断。
+async function loadCaptionVisionConfigLazy(): Promise<import("../image-router").CaptionVisionConfig> {
+  const settingsMod = await import("../../settings/model-settings.js");
+  const settings = settingsMod.resolveModelSettingsProfile(settingsMod.loadModelSettings());
+  const router = await import("../image-router.js");
+  return router.resolveCaptionVisionConfig(settings);
 }
 
 async function executeReadImage(
@@ -498,8 +542,11 @@ async function executeReadImage(
   ctx?: ToolContext,
 ): Promise<string> {
   const raw = String(args.path || "").trim();
-  const filePath = ensureAbsolute(raw);
+  let filePath = ensureAbsolute(raw);
   if (!filePath) return "[错误] path 必须是绝对路径";
+  const access = resolveFileAccessPath(filePath, "read", ctx);
+  if (!access.ok) return "[拒绝] " + access.message;
+  filePath = access.path;
 
   const stat = safeStat(filePath);
   if (!stat) return "[错误] 文件不存在或无法访问: " + filePath;
@@ -533,10 +580,10 @@ async function executeReadImage(
     return "[错误] 读取失败: " + msg;
   }
 
-  // 查视觉模型配置（统一判断入口，不再有调度层门控）
-  const visionConfig = loadVisionConfigLazy();
-  if (!visionConfig) {
-    return "[错误·配置] 未启用视觉能力。请在「设置 → API 设置 → 视觉模型」配置一个 OpenAI 兼容的视觉模型。";
+  // 查图片转述路由（image-router 统一判定；Anthropic 主模型未配视觉模型时在此明确拒绝）
+  const captionVision = await loadCaptionVisionConfigLazy();
+  if (!captionVision.ok) {
+    return "[错误·配置] " + captionVision.error;
   }
 
   // 调视觉模型看图，用户问题从 ToolContext 来
@@ -544,7 +591,7 @@ async function executeReadImage(
   const result = await captionImage(
     { base64: buf.toString("base64"), mime },
     userQuery,
-    visionConfig,
+    captionVision.config,
   );
   return result;
 }
@@ -556,17 +603,18 @@ toolRegistry.register({
     "读取本地图片文件，交给视觉模型分析后返回文字描述。支持 png/jpg/jpeg/gif/webp/bmp/svg，最大 5MB。\n\n" +
     "何时用：\n" +
     "- 用户提到截图、图片，想知道内容\n" +
-    "- 用户说'看看这张图''图片里是什么'\n" +
-    "- 环境信息里说'当前模型支持查看图片'时\n\n" +
+    "- 用户说'看看这张图''图片里是什么'\n\n" +
     "不要用于：\n" +
-    "- 环境信息说'不支持查看图片'时（直接告诉用户看不了，不要调）\n" +
     "- 读文本文件 → read_file\n" +
     "- 批量读图（逐张调用，不要一次性塞多张）\n\n" +
     "若未配置视觉模型会返回错误，届时如实告诉用户看不了。" +
+    "用户本轮附加图片时，会提供绝对路径；图片只在调用本工具时读取。\n" +
     "参数：path (必填，绝对路径)。",
   enabled: true,
   risk: "fs-read",
-  modes: ["learn", "code", "work"],
+  modes: ["chat", "learn", "code", "work"],
+  chatBuiltin: true,
+  requiresFileAttachments: true,
   effectKind: "read" as const,
   verificationPolicy: "none" as const,
   needsContext: true,

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { ToolExecutionRecord } from "../../../../../shared/chat-types";
 import {
   applyAgentRoundBoundary,
+  buildAskUserQa,
+  buildFlatRunTimeline,
   countRoundChangedFiles,
   createRoundProcessMessage,
   describeToolExecution,
@@ -81,7 +83,37 @@ describe("agent round presentation", () => {
       label: "写入文件",
       statusText: "正在写入文件",
       detail: "src/renderer/App.tsx",
+      filePaths: ["src/renderer/App.tsx"],
     });
+  });
+
+  it.each([
+    ["Read", "file_path"], ["Write", "file_path"], ["Edit", "file_path"],
+    ["read_file", "path"], ["write_file", "path"], ["edit_file", "filePath"], ["str_replace", "file_path"],
+  ])("exposes the target file of %s without including source text", (name, pathKey) => {
+    const filePath = "D:\\项目\\src\\characters.ts";
+    const presentation = describeToolExecution({
+      id: "file-tool", name, status: "success",
+      argsText: JSON.stringify({ [pathKey]: filePath, content: "private source", old_string: "private old source" }),
+    });
+    expect(presentation.filePaths).toEqual([filePath]);
+    expect(JSON.stringify(presentation)).not.toContain("private");
+  });
+
+  it("exposes every changed file for a multi-file patch, including legacy result-only records", () => {
+    const changes = [
+      { file: "src/a.ts", kind: "modified" as const, insertions: 1, deletions: 1 },
+      { file: "src/b.tsx", kind: "added" as const, insertions: 2, deletions: 0 },
+    ];
+    expect(describeToolExecution({ id: "patch", name: "apply_patch", status: "success", changes }).filePaths)
+      .toEqual(["src/a.ts", "src/b.tsx"]);
+    expect(describeToolExecution({ id: "legacy", name: "apply_patch", status: "success", result: JSON.stringify({ changes }) }).filePaths)
+      .toEqual(["src/a.ts", "src/b.tsx"]);
+  });
+
+  it.each(["run_shell", "Glob", "Grep", "list_dir", "search_code"])("keeps %s out of file preview targets", (name) => {
+    expect(describeToolExecution({ id: "other", name, status: "success", argsText: '{"path":"src"}' }).filePaths)
+      .toBeUndefined();
   });
 
   it("keeps the activity useful when streamed arguments are malformed", () => {
@@ -133,6 +165,147 @@ describe("agent round presentation", () => {
     const round = startAgentRound([], "round-0", 100)[0];
     expect(resolveAgentRoundTitle(round, [tool("a", "read_file", "error")], true))
       .toBe("昔涟已中断 · 1 项失败");
+  });
+
+  it("prefers the registry display name over the i18n mapping and raw id", () => {
+    const record: ToolExecutionRecord = {
+      id: "play-1",
+      name: "music_play_track",
+      displayName: "播放歌曲",
+      status: "running",
+    };
+    expect(describeToolExecution(record)).toEqual({
+      label: "播放歌曲",
+      statusText: "正在播放歌曲",
+      detail: undefined,
+    });
+  });
+
+  it("falls back to the i18n mapping for records without a display name", () => {
+    expect(describeToolExecution({
+      id: "read-legacy",
+      name: "read_file",
+      status: "success",
+    })).toEqual({
+      label: "读取文件",
+      statusText: "读取文件完成",
+      detail: undefined,
+    });
+  });
+
+  it("shows the raw tool id when neither display name nor mapping exists", () => {
+    expect(describeToolExecution({
+      id: "unknown-1",
+      name: "music_play_track",
+      status: "success",
+    })).toEqual({
+      label: "music_play_track",
+      statusText: "执行操作完成",
+      detail: undefined,
+    });
+  });
+
+  it("describes an ask_user call with waiting and answered states", () => {
+    expect(describeToolExecution({
+      id: "ask-1",
+      name: "ask_user",
+      status: "running",
+    })).toEqual({
+      label: "询问用户",
+      statusText: "等待用户回答",
+      detail: undefined,
+    });
+    expect(describeToolExecution({
+      id: "ask-1",
+      name: "ask_user",
+      status: "success",
+    })).toEqual({
+      label: "询问用户",
+      statusText: "用户已回答",
+      detail: undefined,
+    });
+    expect(describeToolExecution({
+      id: "ask-1",
+      name: "ask_user",
+      status: "error",
+    })).toEqual({
+      label: "询问用户",
+      statusText: "询问用户失败",
+      detail: undefined,
+    });
+  });
+});
+
+describe("buildAskUserQa", () => {
+  it("splits an ask_user tool result into readable question rows", () => {
+    expect(buildAskUserQa({
+      id: "ask-1",
+      name: "ask_user",
+      status: "success",
+      result: "使用哪个数据库？ → PostgreSQL\n部署到哪个环境？ → 测试环境",
+    })).toEqual([
+      "使用哪个数据库？ → PostgreSQL",
+      "部署到哪个环境？ → 测试环境",
+    ]);
+  });
+
+  it("returns no rows for empty or non-ask results", () => {
+    expect(buildAskUserQa({ id: "ask-1", name: "ask_user", status: "running" })).toEqual([]);
+    expect(buildAskUserQa({ id: "t-1", name: "list_dir", status: "success", result: "src" })).toEqual([]);
+  });
+});
+
+describe("buildFlatRunTimeline", () => {
+  it("interleaves reasoning, process text and tools by seq across categories", () => {
+    const entries = buildFlatRunTimeline({
+      processMessages: [
+        { id: "p-0", content: "先看结构", seq: 1 },
+        { id: "p-1", content: "继续检查", seq: 4 },
+      ],
+      reasoningBlocks: [
+        { id: "r-0", content: "思考目录", seq: 0 },
+        { id: "r-1", content: "查找入口", seq: 3 },
+      ],
+      tools: [{ id: "t-0", name: "list_dir", status: "success", seq: 2 }],
+      taskDelegations: [],
+    });
+
+    expect(entries.map((entry) => entry.kind)).toEqual([
+      "reasoning", "process", "tool", "reasoning", "process",
+    ]);
+    expect(entries.map((entry) => entry.key)).toEqual(["r-0", "p-0", "t-0", "r-1", "p-1"]);
+  });
+
+  it("falls back to afterToolCount ordering for legacy records without seq", () => {
+    const entries = buildFlatRunTimeline({
+      processMessages: [
+        { id: "p-0", content: "第一段正文", afterToolCount: 0 },
+        { id: "p-1", content: "第二段正文", afterToolCount: 1 },
+      ],
+      reasoningBlocks: [{ id: "r-0", content: "思考", afterToolCount: 0 }],
+      tools: [
+        { id: "t-0", name: "list_dir", status: "success" },
+        { id: "t-1", name: "read_file", status: "success" },
+      ],
+      taskDelegations: [],
+    });
+
+    // 旧记录回退：正文 → 推理 → 工具0 → 正文 → 工具1（沿用既有 afterToolCount 顺序）
+    expect(entries.map((entry) => entry.key)).toEqual(["p-0", "r-0", "t-0", "p-1", "t-1"]);
+  });
+
+  it("keeps parallel tool calls in their original order", () => {
+    const entries = buildFlatRunTimeline({
+      processMessages: [{ id: "p-0", content: "正文", seq: 0 }],
+      reasoningBlocks: [],
+      tools: [
+        { id: "t-a", name: "read_file", status: "success", seq: 1 },
+        { id: "t-b", name: "read_file", status: "success", seq: 2 },
+      ],
+      taskDelegations: [],
+    });
+
+    expect(entries.map((entry) => entry.key)).toEqual(["p-0", "t-a", "t-b"]);
   });
 });
 

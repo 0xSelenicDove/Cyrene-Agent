@@ -1,9 +1,7 @@
-import { createHash } from "node:crypto";
 import type { ChatMessage, VendorConfig } from "../../vendors/types";
 import type { ToolDefinition } from "../../tools/registry/tool-registry";
 import { toolRegistry } from "../../tools/registry/tool-registry";
-import { prepareHarnessRecovery } from "../run-recovery";
-import { getHarnessRunStore, type HarnessRequestSnapshot } from "../run-store";
+import { getHarnessRunStore } from "../run-store";
 import type { CyreneRunOptions } from "../../cyrene-agent";
 import type { PromptLayers } from "../../prompt-layers";
 import type { ConversationMode } from "../../../../shared/chat-types";
@@ -13,6 +11,7 @@ import {
 } from "./prompt-builder";
 import { preparePlanRunContext } from "./plan-lifecycle";
 import { app } from "electron";
+import { createPersistentExecutionLedger } from "../../../storage/persistent-execution-ledger";
 
 /**
  * 运行准备阶段：解析线程/运行 ID、计划上下文、恢复快照、提示词层和工具清单，
@@ -36,32 +35,6 @@ export function filterToolsForConversationMode(
   return tools.filter((tool) => !CODE_ONLY_GIT_TOOL_IDS.has(tool.id));
 }
 
-function fingerprint(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-function snapshotHarnessRequest(
-  options: CyreneRunOptions,
-  promptLayers: PromptLayers,
-  tools: ToolDefinition[],
-): HarnessRequestSnapshot {
-  return {
-    provider: options.settings.provider,
-    model: options.settings.model,
-    contextWindowTokens: options.settings.contextWindowTokens,
-    ...(options.settings.reasoning ? { reasoning: JSON.stringify(options.settings.reasoning) } : {}),
-    ...(options.conversationMode ? { mode: options.conversationMode } : {}),
-    promptFingerprint: fingerprint(promptLayers.stablePrefix),
-    toolSchemaFingerprint: fingerprint(tools.map((tool) => ({
-      id: tool.id,
-      description: tool.description,
-      schema: tool.inputSchema,
-    })).sort((left, right) => left.id.localeCompare(right.id))),
-    enabledToolIds: tools.map((tool) => tool.id).sort(),
-    ...(options.resolvedWorkspaceRoot ? { workspaceRoot: options.resolvedWorkspaceRoot } : {}),
-  };
-}
-
 export interface PreparedHarnessRun {
   threadId: string;
   runId: string;
@@ -73,7 +46,6 @@ export interface PreparedHarnessRun {
   harnessPromptLayers: PromptLayers;
   systemPrompt: string;
   runMessages: ChatMessage[];
-  recovered?: ReturnType<typeof prepareHarnessRecovery>;
   runStore: ReturnType<typeof getHarnessRunStore>;
 }
 
@@ -81,7 +53,7 @@ export async function prepareHarnessRun(
   options: CyreneRunOptions,
   signal: AbortSignal,
 ): Promise<PreparedHarnessRun> {
-  const messageId = `msg-${Date.now()}`;
+  const messageId = options.assistantTurnId ?? `msg-${Date.now()}`;
   const runId = options.runId;
   // 先校验 runId，避免产生无法关联到 RUN_FINISHED/恢复记录的孤儿执行。
   if (!runId) {
@@ -104,31 +76,15 @@ export async function prepareHarnessRun(
     apiKey: options.settings.apiKey,
     explicitTransport: options.settings.explicitTransport,
     reasoning: options.settings.reasoning,
+    manualReasoning: options.settings.manualReasoning,
+    imageGeneration: options.settings.imageGeneration,
   };
 
   const tools = [...(options.capabilities?.tools ?? options.tools ?? toolRegistry.getEnabledTools())];
   const runStore = getHarnessRunStore(app.getPath("userData"));
-  const recovered = options.resumeFromRunId
-    ? (() => {
-      const previous = runStore.get(options.resumeFromRunId!);
-      if (!previous || previous.conversationId !== threadId) throw new Error("HARNESS_RECOVERY_NOT_FOUND");
-      return prepareHarnessRecovery(previous, {
-        workspaceRoot: options.resolvedWorkspaceRoot,
-        provider: options.settings.provider,
-        model: options.settings.model,
-        enabledToolIds: tools.map((tool) => tool.id),
-      });
-    })()
-    : undefined;
-
-  const latestIncomingMessage = options.messages.at(-1);
-  const baseRunMessages = recovered
-    ? [
-      ...recovered.messages,
-      ...(latestIncomingMessage?.role === "user" ? [{ ...latestIncomingMessage }] : []),
-    ]
-    : options.messages;
-  const recoveryContext = [options.recoveryContext, recovered?.recoveryContext, planContextBlock]
+  // 消息历史与待办/未决副作用均来自会话轨迹投影；这里只为旧入口保留兼容文本提示。
+  const baseRunMessages = options.messages;
+  const recoveryContext = [options.recoveryContext, planContextBlock]
     .filter(Boolean).join("\n\n");
   const promptLayers = buildHarnessPromptLayers(
     recoveryContext ? { ...options, recoveryContext } : options,
@@ -137,23 +93,19 @@ export async function prepareHarnessRun(
     messages: baseRunMessages,
     runId,
     runtimeContext: promptLayers.runtimeContext,
-    initialState: recovered?.state,
-    kind: recovered ? "recovery" : "run_start",
+    kind: "run_start",
   });
-  // create 必须发生在 Harness 启动前，并使用最终消息/提示词/工具指纹，供 checkpoint 和恢复校验复用。
+  // create 必须发生在 Harness 启动前；运行文件只承担启动对账、终态和 Review 时间戳。
   const harnessPromptLayers: PromptLayers = {
     stablePrefix: promptLayers.stablePrefix,
     ...(promptLayers.sessionPrefix ? { sessionPrefix: promptLayers.sessionPrefix } : {}),
     ...(promptLayers.mode ? { mode: promptLayers.mode } : {}),
   };
   const systemPrompt = harnessPromptLayers.stablePrefix;
-  runStore.create({
+  options.executionLedger = createPersistentExecutionLedger(app.getPath("userData"), threadId);
+  await runStore.create({
     conversationId: threadId,
     runId,
-    messages: runMessages,
-    request: snapshotHarnessRequest(options, harnessPromptLayers, tools),
-    ...(recovered ? { state: recovered.state, cache: recovered.cache } : {}),
-    ...(options.resumeFromRunId ? { resumedFromRunId: options.resumeFromRunId } : {}),
   });
 
   return {
@@ -167,7 +119,6 @@ export async function prepareHarnessRun(
     harnessPromptLayers,
     systemPrompt,
     runMessages,
-    ...(recovered ? { recovered } : {}),
     runStore,
   };
 }

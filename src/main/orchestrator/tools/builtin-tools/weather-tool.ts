@@ -11,9 +11,9 @@
 // built-in-tools.snapshot.test.ts）。
 
 import type { ToolDefinition } from "../registry/tool-registry";
-import type { ToolContext } from "../registry/tool-context";
 import { getDateLocale, getWeatherLanguage } from "../../../locale-context";
 import { currentUserTimezone } from "./timezone";
+import { TtlResultCache } from "./ttl-result-cache";
 
 // ── 工具 4：weather（天气查询）─────────────────────────────
 // 查指定城市的实时天气。城市参数可选——没传就读用户信息的默认城市。
@@ -24,64 +24,59 @@ import { currentUserTimezone } from "./timezone";
 
 const WEATHER_TIMEOUT_MS = 15_000;
 
+// ── 天气查询缓存 ─────────────────────────────────────────
+// 模型常被反复问"今天天气怎样"（伙伴场景高频问题），两层缓存：
+// - 城市→坐标/adcode 解析：24 小时——城市不会搬家
+// - 天气结果：30 分钟——天气半小时内变化有限，命中时补 cached/cachedAt 让模型自知新鲜度；
+const WEATHER_CACHE_TTL_MS = 30 * 60_000;
+const GEOCODE_CACHE_TTL_MS = 24 * 60 * 60_000;
+
+interface WeatherCacheEntry {
+  data: Record<string, unknown>;
+}
+
+const omCityCache = new TtlResultCache<OMCity>(GEOCODE_CACHE_TTL_MS);
+const amapDistrictCache = new TtlResultCache<AmapDistrict>(GEOCODE_CACHE_TTL_MS);
+const weatherCache = new TtlResultCache<WeatherCacheEntry>(WEATHER_CACHE_TTL_MS);
+
+/** 清空天气相关缓存（测试隔离用） */
+export function clearWeatherCaches(): void {
+  omCityCache.clear();
+  amapDistrictCache.clear();
+  weatherCache.clear();
+}
+
 /** 注入的配置获取器（由 index.ts 启动时调 setWeatherConfig 设置）。 */
 let weatherCityGetter: (() => string) | null = null;
 let weatherSourceGetter: (() => string) | null = null;
 let amapKeyGetter: (() => string) | null = null;
 let weatherEnabledGetter: (() => boolean) | null = null;
 
-/** 天气卡片数据回调：工具拿到结构化数据后调这个，由桥层发 Custom 事件给渲染端。 */
-let weatherCardCallback: ((card: WeatherCardData, context?: ToolContext) => void) | null = null;
-
-/** 天气卡片结构化数据（发给渲染端渲染 WeatherCard 用）。
- *  字段与 renderer 侧 weather-types.ts 中的 WeatherData 保持一致。
- */
-export interface WeatherCardData {
-  source: "open-meteo" | "amap";
-  location: {
-    province: string;
-    city: string;
-  };
-  // Open-Meteo 字段
-  weatherCode?: number;
-  temp: number;
-  feelsLike?: number;
-  humidity: number;
-  windDeg?: number;
-  windSpeed?: number;
-  precipitation?: number;
-  pressure?: number;
-  // 高德字段
-  weather?: string;
-  windDirection?: string;
-  windPower?: string;
-  reporttime?: string;
-}
-
 /**
- * index.ts 启动时调用，注入默认城市/天气源/高德key/卡片回调 的读取器。
+ * index.ts 启动时调用，注入默认城市/天气源/高德key/天气功能开关的读取器。
  * source: "open-meteo"（免配置默认）| "amap"（高德）
  */
 export function setWeatherConfig(
   cityGetter: () => string,
   sourceGetter: () => string,
   amapKeyFn: () => string,
-  cardCb?: (card: WeatherCardData, context?: ToolContext) => void,
   enabledGetter?: () => boolean,
 ): void {
   weatherCityGetter = cityGetter;
   weatherSourceGetter = sourceGetter;
   amapKeyGetter = amapKeyFn;
   weatherEnabledGetter = enabledGetter ?? null;
-  if (cardCb) weatherCardCallback = cardCb;
 }
 
 // ── Open-Meteo 实现（免 key 免配置）──
 
 interface OMCity { name: string; latitude: number; longitude: number; country: string; admin1?: string }
 
-/** Open-Meteo 城市查询（Geocoding API，免费免 key）。 */
+/** Open-Meteo 城市查询（Geocoding API，免费免 key）。结果缓存 24 小时。 */
 async function omResolveCity(city: string): Promise<OMCity | null> {
+  const cacheKey = city + "|" + getWeatherLanguage();
+  const hit = omCityCache.get(cacheKey);
+  if (hit) return hit.value;
   const params = new URLSearchParams({ name: city, count: "1", language: getWeatherLanguage(), format: "json" });
   const url = `https://geocoding-api.open-meteo.com/v1/search?${params}`;
   const ctrl = new AbortController();
@@ -91,6 +86,8 @@ async function omResolveCity(city: string): Promise<OMCity | null> {
     if (!resp.ok) return null;
     const data = await resp.json() as { results?: OMCity[] };
     if (!data.results || data.results.length === 0) return null;
+    // 只有解析成功才写缓存；null 可能是网络失败也可能是真找不到，都不缓存
+    omCityCache.set(cacheKey, data.results[0]);
     return data.results[0];
   } catch {
     return null;
@@ -99,8 +96,19 @@ async function omResolveCity(city: string): Promise<OMCity | null> {
   }
 }
 
-/** Open-Meteo 实时天气查询（免费免 key）。 */
-async function omFetchWeather(city: string, context?: ToolContext): Promise<string> {
+/** Open-Meteo 实时天气查询（免费免 key）。结果缓存 30 分钟。 */
+async function omFetchWeather(city: string): Promise<string> {
+  // 缓存命中时在文本结果中标注 cached/cachedAt
+  const cacheKey = "open-meteo|" + city;
+  const hit = weatherCache.get(cacheKey);
+  if (hit) {
+    return JSON.stringify({
+      ...hit.value.data,
+      cached: true,
+      cachedAt: new Date(hit.at).toISOString(),
+    });
+  }
+
   const loc = await omResolveCity(city);
   if (!loc) {
     return `[错误] 找不到城市"${city}"，请确认城市名（支持中文/拼音）。`;
@@ -156,21 +164,7 @@ async function omFetchWeather(city: string, context?: ToolContext): Promise<stri
       updateTime: new Date().toLocaleString(getDateLocale(), { hour: "2-digit", minute: "2-digit", timeZone: currentUserTimezone() }),
     };
 
-    // 发送天气卡片数据给渲染端（与 renderer 侧 WeatherData 结构对齐）
-    if (weatherCardCallback) {
-      weatherCardCallback({
-        source: "open-meteo",
-        location: { province: adm, city: loc.name },
-        weatherCode: c.weather_code,
-        temp: c.temperature_2m,
-        feelsLike: c.apparent_temperature,
-        humidity: c.relative_humidity_2m,
-        windDeg: c.wind_direction_10m,
-        windSpeed: c.wind_speed_10m,
-        precipitation: c.precipitation,
-        pressure: Math.round(c.surface_pressure),
-      }, context);
-    }
+    weatherCache.set(cacheKey, { data: weatherData });
 
     return JSON.stringify(weatherData);
   } catch (err) {
@@ -210,8 +204,10 @@ function omWindDir(deg: number): string {
 
 interface AmapDistrict { adcode: string; name: string; level: string }
 
-/** 高德行政区查询：城市名 → adcode。 */
+/** 高德行政区查询：城市名 → adcode。结果缓存 24 小时。 */
 async function amapResolveAdcode(city: string, key: string): Promise<AmapDistrict | null> {
+  const hit = amapDistrictCache.get(city);
+  if (hit) return hit.value;
   const url = `https://restapi.amap.com/v3/config/district?keywords=${encodeURIComponent(city)}&subdistrict=0&key=${key}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), WEATHER_TIMEOUT_MS);
@@ -220,6 +216,8 @@ async function amapResolveAdcode(city: string, key: string): Promise<AmapDistric
     if (!resp.ok) return null;
     const data = await resp.json() as { status?: string; districts?: AmapDistrict[] };
     if (data.status !== "1" || !data.districts || data.districts.length === 0) return null;
+    // 只有解析成功才写缓存；null 可能是网络失败也可能是真找不到，都不缓存
+    amapDistrictCache.set(city, data.districts[0]);
     return data.districts[0];
   } catch {
     return null;
@@ -228,8 +226,19 @@ async function amapResolveAdcode(city: string, key: string): Promise<AmapDistric
   }
 }
 
-/** 高德实时天气查询。 */
-async function amapFetchWeather(city: string, key: string, context?: ToolContext): Promise<string> {
+/** 高德实时天气查询。结果缓存 30 分钟。 */
+async function amapFetchWeather(city: string, key: string): Promise<string> {
+  // 缓存命中时在文本结果中标注 cached/cachedAt
+  const cacheKey = "amap|" + city;
+  const hit = weatherCache.get(cacheKey);
+  if (hit) {
+    return JSON.stringify({
+      ...hit.value.data,
+      cached: true,
+      cachedAt: new Date(hit.at).toISOString(),
+    });
+  }
+
   const district = await amapResolveAdcode(city, key);
   if (!district) {
     return `[错误] 找不到城市"${city}"，请确认城市名（支持中文，如"无锡"）。`;
@@ -263,19 +272,7 @@ async function amapFetchWeather(city: string, key: string, context?: ToolContext
       updateTime: w.reporttime.slice(11, 16) || new Date().toLocaleString(getDateLocale(), { hour: "2-digit", minute: "2-digit" }),
     };
 
-    // 发送天气卡片数据给渲染端（与 renderer 侧 WeatherData 结构对齐）
-    if (weatherCardCallback) {
-      weatherCardCallback({
-        source: "amap",
-        location: { province: w.province, city: w.city },
-        weather: w.weather,
-        temp: Number(w.temperature),
-        humidity: Number(w.humidity),
-        windDirection: w.winddirection,
-        windPower: w.windpower,
-        reporttime: w.reporttime,
-      }, context);
-    }
+    weatherCache.set(cacheKey, { data: weatherData });
 
     return JSON.stringify(weatherData);
   } catch (err) {
@@ -286,7 +283,7 @@ async function amapFetchWeather(city: string, key: string, context?: ToolContext
   }
 }
 
-async function executeWeather(args: Record<string, unknown>, context?: ToolContext): Promise<string> {
+async function executeWeather(args: Record<string, unknown>): Promise<string> {
   if (weatherEnabledGetter && !weatherEnabledGetter()) {
     return "[错误] 天气查询功能未启用，请在设置里开启";
   }
@@ -316,14 +313,14 @@ async function executeWeather(args: Record<string, unknown>, context?: ToolConte
 
   // 按天气源分支
   if (source === "open-meteo") {
-    return omFetchWeather(city, context);
+    return omFetchWeather(city);
   }
   if (source === "amap") {
     const amapKey = amapKeyGetter?.() ?? "";
     if (!amapKey) {
       return "[错误] 还没有配置高德天气 Key。请在 设置 → 插件 → 天气查询 填入高德 Key，或切换天气源为 Open-Meteo（免配置）。";
     }
-    return amapFetchWeather(city, amapKey, context);
+    return amapFetchWeather(city, amapKey);
   }
 
   // 未知天气源
